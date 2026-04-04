@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command;
 
 use crate::error::ToolError;
@@ -77,9 +77,7 @@ impl Tool for Bash {
                     }))
                 } else {
                     let code = output.status.code().unwrap_or(-1);
-                    Ok(ToolOutput::error(format!(
-                        "Exit code: {code}\n{result}"
-                    )))
+                    Ok(ToolOutput::error(format!("Exit code: {code}\n{result}")))
                 }
             }
             Ok(Err(e)) => Err(ToolError::Io(e)),

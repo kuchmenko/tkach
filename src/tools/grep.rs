@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::ToolError;
 use crate::tool::{Tool, ToolContext, ToolOutput};
@@ -75,10 +75,7 @@ impl Tool for Grep {
             let re = regex::Regex::new(&pattern_owned)
                 .map_err(|e| ToolError::InvalidInput(format!("invalid regex: {e}")))?;
 
-            let glob_re = glob_filter
-                .as_deref()
-                .map(|g| glob_to_regex(g))
-                .transpose()?;
+            let glob_re = glob_filter.as_deref().map(glob_to_regex).transpose()?;
 
             let mut matches = Vec::new();
 
@@ -102,7 +99,13 @@ impl Tool for Grep {
                         }
                     }
 
-                    search_file(entry.path(), &re, context_lines, max_results - matches.len(), &mut matches)?;
+                    search_file(
+                        entry.path(),
+                        &re,
+                        context_lines,
+                        max_results - matches.len(),
+                        &mut matches,
+                    )?;
 
                     if matches.len() >= max_results {
                         break;
@@ -151,9 +154,9 @@ fn search_file(
             if context_lines > 0 {
                 let start = i.saturating_sub(context_lines);
                 let end = (i + context_lines + 1).min(lines.len());
-                for j in start..end {
+                for (j, line_content) in lines.iter().enumerate().take(end).skip(start) {
                     let marker = if j == i { ">" } else { " " };
-                    results.push(format!("{path_str}:{}{marker} {}", j + 1, lines[j]));
+                    results.push(format!("{path_str}:{}{marker} {}", j + 1, line_content));
                 }
                 results.push("--".to_string());
             } else {

@@ -1,5 +1,5 @@
 use agent_runtime::{Agent, Tool, ToolContext, ToolError, ToolOutput, providers::Mock, tools};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Example: a custom tool that returns the current time.
 struct CurrentTime;
@@ -31,8 +31,8 @@ impl Tool for CurrentTime {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use agent_runtime::message::{Content, StopReason, Usage};
     use agent_runtime::provider::Response;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Mock provider that first calls current_time, then responds with text
     let call = Arc::new(AtomicUsize::new(0));

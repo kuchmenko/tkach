@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::ToolError;
 use crate::tool::{Tool, ToolContext, ToolOutput};
@@ -68,9 +68,7 @@ impl Tool for WebFetch {
             .map_err(|e| ToolError::Execution(format!("failed to read response body: {e}")))?;
 
         if status >= 400 {
-            Ok(ToolOutput::error(format!(
-                "HTTP {status}\n{body}"
-            )))
+            Ok(ToolOutput::error(format!("HTTP {status}\n{body}")))
         } else {
             // Truncate very large responses
             let max_len = 100_000;

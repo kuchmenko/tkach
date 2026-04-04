@@ -149,8 +149,7 @@ impl Agent {
                             }
                             Err(e) => {
                                 warn!(tool = name.as_str(), error = %e, "tool failed");
-                                results
-                                    .push(Content::tool_result(id, format!("Error: {e}"), true));
+                                results.push(Content::tool_result(id, format!("Error: {e}"), true));
                             }
                         }
                     }

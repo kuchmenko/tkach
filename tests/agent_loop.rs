@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_runtime::message::{Content, StopReason, Usage};
 use agent_runtime::provider::Response;
