@@ -43,4 +43,4 @@ pub use error::{AgentError, ProviderError, ToolError};
 pub use message::{Content, Message, Role, StopReason, Usage};
 pub use provider::{LlmProvider, Request, Response, ToolDefinition};
 pub use tokio_util::sync::CancellationToken;
-pub use tool::{Tool, ToolContext, ToolOutput};
+pub use tool::{Tool, ToolClass, ToolContext, ToolOutput};

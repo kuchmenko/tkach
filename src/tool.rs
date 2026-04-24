@@ -79,6 +79,24 @@ impl ToolOutput {
 ///     }
 /// }
 /// ```
+/// Side-effect class of a tool.
+///
+/// Used by the executor to safely parallelise consecutive read-only calls
+/// in a single batch while keeping mutating calls sequential. Mutating is
+/// the default because misclassifying a side-effectful tool as `ReadOnly`
+/// can lead to subtle ordering bugs (two "mutating" writes racing against
+/// each other); the reverse is merely a missed optimisation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolClass {
+    /// No observable side effects. Safe to run concurrently with other
+    /// `ReadOnly` tools. Examples: `Read`, `Glob`, `Grep`, `WebFetch`.
+    ReadOnly,
+    /// Changes state — file system, external services, processes, or
+    /// nested agents. Must run sequentially to preserve ordering.
+    /// Examples: `Write`, `Edit`, `Bash`, `SubAgent`.
+    Mutating,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Unique name of the tool (used by the LLM to invoke it).
@@ -89,6 +107,14 @@ pub trait Tool: Send + Sync {
 
     /// JSON Schema describing the tool's input parameters.
     fn input_schema(&self) -> Value;
+
+    /// Side-effect class. Defaults to `Mutating` — the safe choice for
+    /// tools that are not explicitly marked read-only. Override to return
+    /// [`ToolClass::ReadOnly`] only when you are certain the tool has no
+    /// observable side effects.
+    fn class(&self) -> ToolClass {
+        ToolClass::Mutating
+    }
 
     /// Execute the tool with the given input.
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;

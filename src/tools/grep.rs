@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::error::ToolError;
-use crate::tool::{Tool, ToolContext, ToolOutput};
+use crate::tool::{Tool, ToolClass, ToolContext, ToolOutput};
 
 /// Search file contents using regex patterns.
 pub struct Grep;
@@ -13,6 +13,10 @@ pub struct Grep;
 impl Tool for Grep {
     fn name(&self) -> &str {
         "grep"
+    }
+
+    fn class(&self) -> ToolClass {
+        ToolClass::ReadOnly
     }
 
     fn description(&self) -> &str {

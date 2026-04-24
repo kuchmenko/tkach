@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::error::ToolError;
-use crate::tool::{Tool, ToolContext, ToolOutput};
+use crate::tool::{Tool, ToolClass, ToolContext, ToolOutput};
 
 /// Fetch content from a URL.
 pub struct WebFetch;
@@ -11,6 +11,10 @@ pub struct WebFetch;
 impl Tool for WebFetch {
     fn name(&self) -> &str {
         "web_fetch"
+    }
+
+    fn class(&self) -> ToolClass {
+        ToolClass::ReadOnly
     }
 
     fn description(&self) -> &str {

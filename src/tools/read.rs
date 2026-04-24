@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::error::ToolError;
-use crate::tool::{Tool, ToolContext, ToolOutput};
+use crate::tool::{Tool, ToolClass, ToolContext, ToolOutput};
 
 /// Read file contents with optional offset and limit.
 pub struct Read;
@@ -13,6 +13,10 @@ pub struct Read;
 impl Tool for Read {
     fn name(&self) -> &str {
         "read"
+    }
+
+    fn class(&self) -> ToolClass {
+        ToolClass::ReadOnly
     }
 
     fn description(&self) -> &str {

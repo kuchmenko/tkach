@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::error::ToolError;
-use crate::tool::{Tool, ToolContext, ToolOutput};
+use crate::tool::{Tool, ToolClass, ToolContext, ToolOutput};
 
 /// Find files matching a glob pattern.
 pub struct Glob;
@@ -11,6 +11,10 @@ pub struct Glob;
 impl Tool for Glob {
     fn name(&self) -> &str {
         "glob"
+    }
+
+    fn class(&self) -> ToolClass {
+        ToolClass::ReadOnly
     }
 
     fn description(&self) -> &str {
