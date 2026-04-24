@@ -7,6 +7,8 @@ mod sub_agent;
 mod web_fetch;
 mod write;
 
+use std::sync::Arc;
+
 pub use bash::Bash;
 pub use edit::Edit;
 pub use glob_tool::Glob;
@@ -18,31 +20,20 @@ pub use write::Write;
 
 use crate::tool::Tool;
 
-/// Returns the default set of file-system and shell tools.
+/// Returns the default set of file-system and shell tools as shared
+/// trait objects.
 ///
-/// Includes: Read, Write, Edit, Glob, Grep, Bash.
-/// Does NOT include SubAgent or WebFetch (add them explicitly).
-pub fn defaults() -> Vec<Box<dyn Tool>> {
+/// Includes: Read, Write, Edit, Glob, Grep, Bash — the stateless tools
+/// that don't need provider/model configuration. Add `WebFetch` and a
+/// pre-configured `SubAgent` explicitly (both require caller decisions
+/// they can't guess).
+pub fn defaults() -> Vec<Arc<dyn Tool>> {
     vec![
-        Box::new(Read),
-        Box::new(Write),
-        Box::new(Edit),
-        Box::new(Glob),
-        Box::new(Grep),
-        Box::new(Bash),
-    ]
-}
-
-/// Returns all available built-in tools.
-pub fn all() -> Vec<Box<dyn Tool>> {
-    vec![
-        Box::new(Read),
-        Box::new(Write),
-        Box::new(Edit),
-        Box::new(Glob),
-        Box::new(Grep),
-        Box::new(Bash),
-        Box::new(SubAgent),
-        Box::new(WebFetch),
+        Arc::new(Read),
+        Arc::new(Write),
+        Arc::new(Edit),
+        Arc::new(Glob),
+        Arc::new(Grep),
+        Arc::new(Bash),
     ]
 }

@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::error::AgentError;
+use crate::executor::{AllowAll, ToolCall, ToolExecutor, ToolPolicy, ToolRegistry};
 use crate::message::{Content, Message, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, ToolDefinition};
 use crate::tool::{Tool, ToolContext};
@@ -41,13 +42,14 @@ pub struct AgentResult {
 /// The core agent runtime.
 ///
 /// Runs an LLM-driven tool loop: sends messages to the LLM, executes any
-/// requested tools, feeds results back, and repeats until the LLM produces
-/// a final text response, max turns are reached, or the caller cancels.
+/// requested tools via the [`ToolExecutor`], feeds results back, and
+/// repeats until the LLM produces a final text response, max turns are
+/// reached, or the caller cancels.
 pub struct Agent {
     provider: Arc<dyn LlmProvider>,
     model: String,
     system: Option<String>,
-    tools: Vec<Box<dyn Tool>>,
+    executor: Arc<ToolExecutor>,
     max_turns: usize,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -61,15 +63,21 @@ impl Agent {
         AgentBuilder::new()
     }
 
+    /// Tool definitions sent to the LLM, sorted by name for deterministic
+    /// ordering (so prompt-cache hashes stay stable across turns).
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.tools
+        let mut defs: Vec<ToolDefinition> = self
+            .executor
+            .registry()
             .iter()
             .map(|t| ToolDefinition {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 input_schema: t.input_schema(),
             })
-            .collect()
+            .collect();
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        defs
     }
 
     fn make_context(&self) -> ToolContext {
@@ -83,13 +91,6 @@ impl Agent {
             agent_depth: self.agent_depth,
             max_agent_depth: self.max_agent_depth,
         }
-    }
-
-    fn find_tool(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools
-            .iter()
-            .find(|t| t.name() == name)
-            .map(|t| t.as_ref())
     }
 
     /// Run the agent loop against the given message history.
@@ -157,13 +158,15 @@ impl Agent {
             history.push(assistant_msg.clone());
             new_messages.push(assistant_msg);
 
-            let tool_calls: Vec<_> = response
+            let tool_calls: Vec<ToolCall> = response
                 .content
                 .iter()
                 .filter_map(|c| match c {
-                    Content::ToolUse { id, name, input } => {
-                        Some((id.clone(), name.clone(), input.clone()))
-                    }
+                    Content::ToolUse { id, name, input } => Some(ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    }),
                     _ => None,
                 })
                 .collect();
@@ -179,34 +182,11 @@ impl Agent {
                 });
             }
 
-            let mut results = Vec::new();
-            for (id, name, input) in &tool_calls {
-                match self.find_tool(name) {
-                    Some(tool) => {
-                        debug!(tool = name.as_str(), "executing tool");
-                        match tool.execute(input.clone(), &ctx).await {
-                            Ok(output) => {
-                                results.push(Content::tool_result(
-                                    id,
-                                    output.content(),
-                                    output.is_error(),
-                                ));
-                            }
-                            Err(e) => {
-                                warn!(tool = name.as_str(), error = %e, "tool failed");
-                                results.push(Content::tool_result(id, format!("Error: {e}"), true));
-                            }
-                        }
-                    }
-                    None => {
-                        warn!(tool = name.as_str(), "tool not found");
-                        results.push(Content::tool_result(
-                            id,
-                            format!("Error: tool '{name}' not found"),
-                            true,
-                        ));
-                    }
-                }
+            let mut results = Vec::with_capacity(tool_calls.len());
+            for call in tool_calls {
+                debug!(tool = call.name.as_str(), "executing tool");
+                let result = self.executor.execute_one(call, &ctx).await;
+                results.push(result);
             }
 
             let user_msg = Message::user(results);
@@ -252,7 +232,8 @@ pub struct AgentBuilder {
     provider: Option<Arc<dyn LlmProvider>>,
     model: Option<String>,
     system: Option<String>,
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
+    policy: Option<Arc<dyn ToolPolicy>>,
     max_turns: usize,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -268,6 +249,7 @@ impl AgentBuilder {
             model: None,
             system: None,
             tools: Vec::new(),
+            policy: None,
             max_turns: 50,
             max_tokens: 16384,
             temperature: None,
@@ -282,7 +264,7 @@ impl AgentBuilder {
         self
     }
 
-    /// Use a shared provider (for sub-agent spawning).
+    /// Use a shared provider (typically for sub-agent spawning).
     pub fn provider_arc(mut self, provider: Arc<dyn LlmProvider>) -> Self {
         self.provider = Some(provider);
         self
@@ -298,13 +280,23 @@ impl AgentBuilder {
         self
     }
 
+    /// Register a tool by value — convenient for concrete built-in tools.
     pub fn tool(mut self, tool: impl Tool + 'static) -> Self {
-        self.tools.push(Box::new(tool));
+        self.tools.push(Arc::new(tool));
         self
     }
 
-    pub fn tools(mut self, tools: Vec<Box<dyn Tool>>) -> Self {
+    /// Register tools as shared trait objects. Matches the shape of
+    /// [`crate::tools::defaults`] and allows one tool instance to live in
+    /// multiple registries (parent + sub-agent).
+    pub fn tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools.extend(tools);
+        self
+    }
+
+    /// Install a tool-invocation policy. Without this, [`AllowAll`] is used.
+    pub fn policy(mut self, policy: impl ToolPolicy + 'static) -> Self {
+        self.policy = Some(Arc::new(policy));
         self
     }
 
@@ -339,11 +331,15 @@ impl AgentBuilder {
     }
 
     pub fn build(self) -> Agent {
+        let registry = Arc::new(ToolRegistry::new(self.tools));
+        let policy: Arc<dyn ToolPolicy> = self.policy.unwrap_or_else(|| Arc::new(AllowAll));
+        let executor = Arc::new(ToolExecutor::new(registry, policy));
+
         Agent {
             provider: self.provider.expect("provider is required"),
             model: self.model.expect("model is required"),
             system: self.system,
-            tools: self.tools,
+            executor,
             max_turns: self.max_turns,
             max_tokens: self.max_tokens,
             temperature: self.temperature,
