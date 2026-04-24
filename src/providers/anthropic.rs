@@ -49,16 +49,45 @@ impl LlmProvider for Anthropic {
         let status = response.status().as_u16();
 
         if status >= 400 {
+            let retry_after_ms = parse_retry_after(response.headers());
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status,
-                message: text,
-            });
+            return Err(classify_error(status, text, retry_after_ms));
         }
 
         let api_response: ApiResponse = response.json().await?;
         Ok(convert_response(api_response))
     }
+}
+
+/// Classify an Anthropic API error into a [`ProviderError`].
+///
+/// - 429 ⇒ `RateLimit`
+/// - 529, 503 ⇒ `Overloaded` (529 is Anthropic-specific; 503 is generic
+///   service unavailable — both are transient server-side pressure signals)
+/// - 500, 502, 504 ⇒ retryable `Api`
+/// - other 5xx ⇒ retryable `Api`, other 4xx ⇒ non-retryable `Api`
+fn classify_error(status: u16, message: String, retry_after_ms: Option<u64>) -> ProviderError {
+    match status {
+        429 => ProviderError::RateLimit { retry_after_ms },
+        529 | 503 => ProviderError::Overloaded { retry_after_ms },
+        500 | 502 | 504 => ProviderError::Api {
+            status,
+            message,
+            retryable: true,
+        },
+        s => ProviderError::Api {
+            status: s,
+            message,
+            retryable: (500..600).contains(&s),
+        },
+    }
+}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    // Spec allows either delay-seconds (integer) or HTTP-date. We only
+    // parse the integer form — OpenAI/Anthropic both use seconds in practice.
+    raw.trim().parse::<u64>().ok().map(|s| s * 1_000)
 }
 
 // --- Anthropic API types ---
