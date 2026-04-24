@@ -6,31 +6,28 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::ToolError;
-use crate::provider::LlmProvider;
+use crate::executor::ToolExecutor;
 
 /// Context passed to every tool execution.
 ///
-/// The `cancel` token is a cooperative cancellation signal. Long-running
-/// tools (shell commands, HTTP requests, recursive file walks, sub-agent
-/// loops) should `tokio::select!` on `cancel.cancelled()` alongside their
-/// main work and return [`ToolError::Cancelled`] promptly when it fires.
-/// The agent loop trusts this contract — it does not race tools at the
-/// outer level; it only checks the token between turns.
+/// Intentionally slim — holds only primitives the runtime actually owns
+/// and wants to share with tools:
+///
+/// - `working_dir`: file-system base for path resolution.
+/// - `cancel`: cooperative cancellation. Long-running tools should
+///   `tokio::select!` on `cancel.cancelled()` and return
+///   [`ToolError::Cancelled`] promptly.
+/// - `depth` / `max_depth`: current nesting level of the agent; used by
+///   `SubAgent` to prevent unbounded recursion.
+/// - `executor`: the parent agent's [`ToolExecutor`], letting tools that
+///   spawn nested work (e.g. `SubAgent`) inherit the full toolset
+///   automatically — no explicit layering required.
 pub struct ToolContext {
-    /// Working directory for file operations.
     pub working_dir: PathBuf,
-
-    /// Cooperative cancellation signal. Tools should honour this.
     pub cancel: CancellationToken,
-
-    // --- Internal fields for sub-agent support ---
-    pub(crate) provider: Arc<dyn LlmProvider>,
-    pub(crate) model: String,
-    pub(crate) max_turns: usize,
-    pub(crate) max_tokens: u32,
-    pub(crate) temperature: Option<f32>,
-    pub(crate) agent_depth: usize,
-    pub(crate) max_agent_depth: usize,
+    pub depth: usize,
+    pub max_depth: usize,
+    pub executor: Arc<ToolExecutor>,
 }
 
 /// Result of a tool execution.
@@ -57,6 +54,24 @@ impl ToolOutput {
             ToolOutput::Text(s) | ToolOutput::Error(s) => s,
         }
     }
+}
+
+/// Side-effect class of a tool.
+///
+/// Used by the executor to safely parallelise consecutive read-only calls
+/// in a single batch while keeping mutating calls sequential. Mutating is
+/// the default because misclassifying a side-effectful tool as `ReadOnly`
+/// can lead to subtle ordering bugs (two "mutating" writes racing against
+/// each other); the reverse is merely a missed optimisation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolClass {
+    /// No observable side effects. Safe to run concurrently with other
+    /// `ReadOnly` tools. Examples: `Read`, `Glob`, `Grep`, `WebFetch`.
+    ReadOnly,
+    /// Changes state — file system, external services, processes, or
+    /// nested agents. Must run sequentially to preserve ordering.
+    /// Examples: `Write`, `Edit`, `Bash`, `SubAgent`.
+    Mutating,
 }
 
 /// Trait for tools that the agent can use.
@@ -90,24 +105,6 @@ impl ToolOutput {
 ///     }
 /// }
 /// ```
-/// Side-effect class of a tool.
-///
-/// Used by the executor to safely parallelise consecutive read-only calls
-/// in a single batch while keeping mutating calls sequential. Mutating is
-/// the default because misclassifying a side-effectful tool as `ReadOnly`
-/// can lead to subtle ordering bugs (two "mutating" writes racing against
-/// each other); the reverse is merely a missed optimisation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolClass {
-    /// No observable side effects. Safe to run concurrently with other
-    /// `ReadOnly` tools. Examples: `Read`, `Glob`, `Grep`, `WebFetch`.
-    ReadOnly,
-    /// Changes state — file system, external services, processes, or
-    /// nested agents. Must run sequentially to preserve ordering.
-    /// Examples: `Write`, `Edit`, `Bash`, `SubAgent`.
-    Mutating,
-}
-
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Unique name of the tool (used by the LLM to invoke it).

@@ -1,14 +1,81 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
 use crate::error::ToolError;
 use crate::message::Message;
+use crate::provider::LlmProvider;
 use crate::tool::{Tool, ToolContext, ToolOutput};
 
-/// Spawn a sub-agent with its own system prompt and conversation.
-pub struct SubAgent;
+/// Spawn a nested agent that reuses its parent's tool executor.
+///
+/// ## Design (Model 3)
+///
+/// `SubAgent` is **stateful**: it holds its own provider, model, and
+/// per-run limits, captured at construction. The LLM can only set the
+/// sub-agent's `prompt` and (optionally) override `system` per invocation
+/// — `model`, `max_turns`, `max_tokens` etc. are fixed so the parent
+/// agent can rely on predictable sub-agent behaviour.
+///
+/// At execute time the sub-agent builds a fresh [`Agent`] using the
+/// **parent's [`ToolExecutor`] from [`ToolContext`]** rather than a
+/// separately-configured toolset. This is the critical Model 3 property:
+/// a child automatically inherits the parent's full registry — custom
+/// tools, `WebFetch`, even another `SubAgent` instance — which enables
+/// multi-level nesting up to `max_depth` without any explicit layering
+/// or `Arc` cycles.
+///
+/// The child gets a cancellation token via [`tokio_util::sync::CancellationToken::child_token`],
+/// so cancelling the parent cascades; and `ctx.depth + 1` is enforced
+/// against `ctx.max_depth` to cap recursion.
+pub struct SubAgent {
+    provider: Arc<dyn LlmProvider>,
+    model: String,
+    system: Option<String>,
+    max_turns: usize,
+    max_tokens: u32,
+    temperature: Option<f32>,
+}
+
+impl SubAgent {
+    /// Construct a sub-agent tool. Provider and model are required; the
+    /// rest are sensible defaults you can override with the builder-style
+    /// setters.
+    pub fn new(provider: Arc<dyn LlmProvider>, model: impl Into<String>) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+            system: None,
+            max_turns: 30,
+            max_tokens: 4096,
+            temperature: None,
+        }
+    }
+
+    /// Default system prompt for the sub-agent. The LLM can override this
+    /// per invocation via the `system` input field.
+    pub fn system(mut self, system: impl Into<String>) -> Self {
+        self.system = Some(system.into());
+        self
+    }
+
+    pub fn max_turns(mut self, max_turns: usize) -> Self {
+        self.max_turns = max_turns;
+        self
+    }
+
+    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn temperature(mut self, temperature: f32) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
+}
 
 #[async_trait]
 impl Tool for SubAgent {
@@ -18,9 +85,9 @@ impl Tool for SubAgent {
 
     fn description(&self) -> &str {
         "Spawn a sub-agent to handle a complex task autonomously. \
-         The sub-agent gets its own conversation context, system prompt, \
-         and access to file/shell tools. Use this for tasks that require \
-         multi-step reasoning or focused exploration."
+         The sub-agent gets its own conversation context and inherits \
+         the parent agent's full tool set. Use this for tasks that \
+         require multi-step reasoning or focused exploration."
     }
 
     fn input_schema(&self) -> Value {
@@ -33,15 +100,7 @@ impl Tool for SubAgent {
                 },
                 "system": {
                     "type": "string",
-                    "description": "System prompt for the sub-agent (optional)"
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Model to use (optional, defaults to parent's model)"
-                },
-                "max_turns": {
-                    "type": "integer",
-                    "description": "Maximum turns for the sub-agent (optional, default: 30)"
+                    "description": "System prompt for the sub-agent (optional, overrides the default)"
                 }
             },
             "required": ["prompt"]
@@ -49,10 +108,10 @@ impl Tool for SubAgent {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        if ctx.agent_depth >= ctx.max_agent_depth {
+        if ctx.depth >= ctx.max_depth {
             return Ok(ToolOutput::error(format!(
                 "Max sub-agent depth ({}) reached. Cannot spawn further sub-agents.",
-                ctx.max_agent_depth
+                ctx.max_depth
             )));
         }
 
@@ -60,41 +119,31 @@ impl Tool for SubAgent {
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("prompt is required".into()))?;
 
-        let system = input["system"].as_str().map(String::from);
-        let model = input["model"]
-            .as_str()
-            .map(String::from)
-            .unwrap_or_else(|| ctx.model.clone());
-        let max_turns = input["max_turns"]
-            .as_u64()
-            .map(|v| v as usize)
-            .unwrap_or(ctx.max_turns);
+        let system_override = input["system"].as_str().map(String::from);
+        let system = system_override.or_else(|| self.system.clone());
 
         let mut builder = Agent::builder()
-            .provider_arc(ctx.provider.clone())
-            .model(model)
-            .tools(crate::tools::defaults())
-            .max_turns(max_turns)
-            .max_tokens(ctx.max_tokens)
+            .provider_arc(Arc::clone(&self.provider))
+            .model(&*self.model)
+            .executor(Arc::clone(&ctx.executor))
+            .max_turns(self.max_turns)
+            .max_tokens(self.max_tokens)
             .working_dir(&ctx.working_dir)
-            .agent_depth(ctx.agent_depth + 1);
+            .max_depth(ctx.max_depth)
+            .depth(ctx.depth + 1);
 
         if let Some(sys) = system {
             builder = builder.system(sys);
         }
-
-        if let Some(temp) = ctx.temperature {
+        if let Some(temp) = self.temperature {
             builder = builder.temperature(temp);
         }
 
         let agent = builder.build();
+        let child_cancel = ctx.cancel.child_token();
+        let history = vec![Message::user_text(prompt)];
 
-        // Cancellation propagation lands in a later stage; for now the child
-        // uses a fresh, non-cancelled token so the old semantics are preserved.
-        let cancel = CancellationToken::new();
-        let child_history = vec![Message::user_text(prompt)];
-
-        match agent.run(child_history, cancel).await {
+        match agent.run(history, child_cancel).await {
             Ok(result) => Ok(ToolOutput::text(result.text)),
             Err(e) => Ok(ToolOutput::error(format!("Sub-agent error: {e}"))),
         }

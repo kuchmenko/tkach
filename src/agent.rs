@@ -54,13 +54,20 @@ pub struct Agent {
     max_tokens: u32,
     temperature: Option<f32>,
     working_dir: PathBuf,
-    max_agent_depth: usize,
-    agent_depth: usize,
+    max_depth: usize,
+    depth: usize,
 }
 
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
+    }
+
+    /// Borrow the tool executor this agent was built with. Exposed so that
+    /// sub-agents can share the parent's registry + policy without having
+    /// to reconstruct them.
+    pub fn executor(&self) -> &Arc<ToolExecutor> {
+        &self.executor
     }
 
     /// Tool definitions sent to the LLM, sorted by name for deterministic
@@ -84,13 +91,9 @@ impl Agent {
         ToolContext {
             working_dir: self.working_dir.clone(),
             cancel,
-            provider: Arc::clone(&self.provider),
-            model: self.model.clone(),
-            max_turns: self.max_turns,
-            max_tokens: self.max_tokens,
-            temperature: self.temperature,
-            agent_depth: self.agent_depth,
-            max_agent_depth: self.max_agent_depth,
+            depth: self.depth,
+            max_depth: self.max_depth,
+            executor: Arc::clone(&self.executor),
         }
     }
 
@@ -103,9 +106,10 @@ impl Agent {
     /// should extend their history with it to persist progress.
     ///
     /// `cancel` is a cooperative cancellation signal. The loop checks it
-    /// between turns and returns [`AgentError::Cancelled`] when it fires;
-    /// individual tools propagate it to long-running operations (added
-    /// in a later stage of this milestone).
+    /// between turns and after each tool batch, returning
+    /// [`AgentError::Cancelled`] promptly. Tools receive the same token
+    /// via [`ToolContext::cancel`] and are expected to honour it for any
+    /// long-running work.
     ///
     /// On any error, the [`AgentError::partial`] accessor returns the
     /// progress accumulated up to the failure point, so the caller can
@@ -241,12 +245,13 @@ pub struct AgentBuilder {
     system: Option<String>,
     tools: Vec<Arc<dyn Tool>>,
     policy: Option<Arc<dyn ToolPolicy>>,
+    executor_override: Option<Arc<ToolExecutor>>,
     max_turns: usize,
     max_tokens: u32,
     temperature: Option<f32>,
     working_dir: Option<PathBuf>,
-    max_agent_depth: usize,
-    agent_depth: usize,
+    max_depth: usize,
+    depth: usize,
 }
 
 impl AgentBuilder {
@@ -257,12 +262,13 @@ impl AgentBuilder {
             system: None,
             tools: Vec::new(),
             policy: None,
+            executor_override: None,
             max_turns: 50,
             max_tokens: 16384,
             temperature: None,
             working_dir: None,
-            max_agent_depth: 3,
-            agent_depth: 0,
+            max_depth: 3,
+            depth: 0,
         }
     }
 
@@ -295,7 +301,7 @@ impl AgentBuilder {
 
     /// Register tools as shared trait objects. Matches the shape of
     /// [`crate::tools::defaults`] and allows one tool instance to live in
-    /// multiple registries (parent + sub-agent).
+    /// multiple registries.
     pub fn tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools.extend(tools);
         self
@@ -304,6 +310,17 @@ impl AgentBuilder {
     /// Install a tool-invocation policy. Without this, [`AllowAll`] is used.
     pub fn policy(mut self, policy: impl ToolPolicy + 'static) -> Self {
         self.policy = Some(Arc::new(policy));
+        self
+    }
+
+    /// Re-use an existing [`ToolExecutor`] instead of building one from
+    /// the `tools` + `policy` accumulated in the builder. Intended for
+    /// sub-agent spawning, where the child inherits the parent's full
+    /// registry automatically.
+    ///
+    /// When set, `.tool()`, `.tools()`, and `.policy()` are ignored.
+    pub fn executor(mut self, executor: Arc<ToolExecutor>) -> Self {
+        self.executor_override = Some(executor);
         self
     }
 
@@ -327,20 +344,23 @@ impl AgentBuilder {
         self
     }
 
-    pub fn max_agent_depth(mut self, depth: usize) -> Self {
-        self.max_agent_depth = depth;
+    /// Maximum nesting depth for sub-agent recursion. Default: 3.
+    pub fn max_depth(mut self, depth: usize) -> Self {
+        self.max_depth = depth;
         self
     }
 
-    pub(crate) fn agent_depth(mut self, depth: usize) -> Self {
-        self.agent_depth = depth;
+    pub(crate) fn depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
         self
     }
 
     pub fn build(self) -> Agent {
-        let registry = Arc::new(ToolRegistry::new(self.tools));
-        let policy: Arc<dyn ToolPolicy> = self.policy.unwrap_or_else(|| Arc::new(AllowAll));
-        let executor = Arc::new(ToolExecutor::new(registry, policy));
+        let executor = self.executor_override.unwrap_or_else(|| {
+            let registry = Arc::new(ToolRegistry::new(self.tools));
+            let policy: Arc<dyn ToolPolicy> = self.policy.unwrap_or_else(|| Arc::new(AllowAll));
+            Arc::new(ToolExecutor::new(registry, policy))
+        });
 
         Agent {
             provider: self.provider.expect("provider is required"),
@@ -353,8 +373,8 @@ impl AgentBuilder {
             working_dir: self
                 .working_dir
                 .unwrap_or_else(|| std::env::current_dir().expect("failed to get current dir")),
-            max_agent_depth: self.max_agent_depth,
-            agent_depth: self.agent_depth,
+            max_depth: self.max_depth,
+            depth: self.depth,
         }
     }
 }

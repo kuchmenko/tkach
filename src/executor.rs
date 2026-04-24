@@ -219,17 +219,20 @@ mod tests {
         }
     }
 
+    fn empty_executor() -> Arc<ToolExecutor> {
+        Arc::new(ToolExecutor::new(
+            Arc::new(ToolRegistry::new(vec![])),
+            Arc::new(AllowAll),
+        ))
+    }
+
     fn ctx() -> ToolContext {
         ToolContext {
             working_dir: PathBuf::from("/tmp"),
             cancel: tokio_util::sync::CancellationToken::new(),
-            provider: Arc::new(crate::providers::Mock::with_text("")),
-            model: "m".into(),
-            max_turns: 1,
-            max_tokens: 1,
-            temperature: None,
-            agent_depth: 0,
-            max_agent_depth: 1,
+            depth: 0,
+            max_depth: 1,
+            executor: empty_executor(),
         }
     }
 

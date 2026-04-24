@@ -6,9 +6,12 @@
 
 use std::path::Path;
 
+use std::sync::Arc;
+
 use agent_runtime::message::{Content, Message};
 use agent_runtime::providers::Anthropic;
-use agent_runtime::{Agent, AgentResult, CancellationToken};
+use agent_runtime::tools::SubAgent;
+use agent_runtime::{Agent, AgentResult, CancellationToken, LlmProvider};
 
 fn prompt(text: &str) -> Vec<Message> {
     vec![Message::user_text(text)]
@@ -38,13 +41,18 @@ fn haiku_agent(working_dir: &Path) -> Agent {
 }
 
 fn sonnet_agent(working_dir: &Path) -> Agent {
+    let provider: Arc<dyn LlmProvider> = Arc::new(require_api_key());
+    let sub_agent = SubAgent::new(Arc::clone(&provider), "claude-haiku-4-5-20251001")
+        .max_turns(10)
+        .max_tokens(2048);
+
     Agent::builder()
-        .provider(require_api_key())
+        .provider_arc(provider)
         .model("claude-sonnet-4-6")
         .system("You are a concise coding assistant. Use tools when needed. Be brief.")
         .tools(agent_runtime::tools::defaults())
         .tool(agent_runtime::tools::WebFetch)
-        .tool(agent_runtime::tools::SubAgent)
+        .tool(sub_agent)
         .max_turns(15)
         .max_tokens(4096)
         .working_dir(working_dir)
