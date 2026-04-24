@@ -182,12 +182,8 @@ impl Agent {
                 });
             }
 
-            let mut results = Vec::with_capacity(tool_calls.len());
-            for call in tool_calls {
-                debug!(tool = call.name.as_str(), "executing tool");
-                let result = self.executor.execute_one(call, &ctx).await;
-                results.push(result);
-            }
+            debug!(count = tool_calls.len(), "executing tool batch");
+            let results = self.executor.execute_batch(tool_calls, &ctx).await;
 
             let user_msg = Message::user(results);
             history.push(user_msg.clone());
