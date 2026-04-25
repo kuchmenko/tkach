@@ -19,6 +19,7 @@ use futures::future::join_all;
 use serde_json::Value;
 use tracing::warn;
 
+use crate::approval::{ApprovalDecision, ApprovalHandler, AutoApprove};
 use crate::message::Content;
 use crate::tool::{Tool, ToolClass, ToolContext};
 
@@ -94,20 +95,55 @@ impl ToolPolicy for AllowAll {
     }
 }
 
-/// Dispatches tool calls against a registry, gated by a policy.
+/// Dispatches tool calls against a registry, gated by a policy and an
+/// approval handler.
 ///
-/// Cloning `Arc<ToolExecutor>` is cheap and intended: sub-agents share the
-/// same executor with their parent so a nested agent automatically inherits
-/// the parent's entire toolset (including `SubAgent` itself — multi-level
-/// nesting comes for free up to `max_depth`).
+/// Two gates run before every tool invocation:
+///
+/// 1. [`ToolPolicy::is_allowed`] — *static* gate. Synchronous, no UI
+///    interaction; decides whether the tool may run at all based on
+///    its name. Denial here surfaces as `is_error: true` tool_result.
+/// 2. [`ApprovalHandler::approve`] — *dynamic* gate. Async, may block
+///    on a UI prompt. Decides whether *this specific call* with
+///    *these specific arguments* may run. Denial also surfaces as
+///    `is_error: true` tool_result so the model can adapt.
+///
+/// The approval call is raced against `ctx.cancel.cancelled()`, so an
+/// outer cancel always wins over a hung UI.
+///
+/// Cloning `Arc<ToolExecutor>` is cheap and intended: sub-agents share
+/// the same executor with their parent so nested agents automatically
+/// inherit the same registry, policy, AND approval handler (Model 3).
 pub struct ToolExecutor {
     registry: Arc<ToolRegistry>,
     policy: Arc<dyn ToolPolicy>,
+    approval: Arc<dyn ApprovalHandler>,
 }
 
 impl ToolExecutor {
+    /// Construct an executor with the default `AutoApprove` handler.
+    /// Backwards-compatible with pre-#6 callers — same behaviour.
     pub fn new(registry: Arc<ToolRegistry>, policy: Arc<dyn ToolPolicy>) -> Self {
-        Self { registry, policy }
+        Self {
+            registry,
+            policy,
+            approval: Arc::new(AutoApprove),
+        }
+    }
+
+    /// Construct an executor with an explicit approval handler.
+    /// Used by `AgentBuilder::approval(...)`; consumers can also
+    /// construct directly when bypassing the builder.
+    pub fn with_approval(
+        registry: Arc<ToolRegistry>,
+        policy: Arc<dyn ToolPolicy>,
+        approval: Arc<dyn ApprovalHandler>,
+    ) -> Self {
+        Self {
+            registry,
+            policy,
+            approval,
+        }
     }
 
     pub fn registry(&self) -> &Arc<ToolRegistry> {
@@ -115,9 +151,9 @@ impl ToolExecutor {
     }
 
     /// Execute a single tool call. Always returns a `tool_result` `Content`
-    /// block — even on policy denial, missing tool, or tool error (with
-    /// `is_error: true`). The loop never aborts on a tool problem; the LLM
-    /// sees the error and may adapt.
+    /// block — even on policy denial, approval denial, missing tool, or
+    /// tool error (with `is_error: true`). The loop never aborts on a
+    /// tool problem; the LLM sees the error and may adapt.
     pub async fn execute_one(&self, call: ToolCall, ctx: &ToolContext) -> Content {
         if !self.policy.is_allowed(&call.name) {
             return Content::tool_result(
@@ -134,6 +170,29 @@ impl ToolExecutor {
                 true,
             );
         };
+
+        // Dynamic gate: ask the approval handler. Race against the
+        // outer cancellation token so a hung UI cannot deadlock the
+        // agent indefinitely — `cancel.cancel()` always wins.
+        let class = tool.class();
+        let decision = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {
+                return Content::tool_result(
+                    &call.id,
+                    "Error: cancelled while awaiting approval",
+                    true,
+                );
+            }
+            d = self.approval.approve(&call.name, &call.input, class) => d,
+        };
+        if let ApprovalDecision::Deny(reason) = decision {
+            return Content::tool_result(
+                &call.id,
+                format!("Error: approval denied — {reason}"),
+                true,
+            );
+        }
 
         match tool.execute(call.input, ctx).await {
             Ok(output) => Content::tool_result(&call.id, output.content(), output.is_error()),
@@ -557,6 +616,127 @@ mod tests {
         assert!(
             !m2_ran.load(std::sync::atomic::Ordering::SeqCst),
             "m2 must not have run after cancel"
+        );
+    }
+
+    // --- Approval-gate tests -----------------------------------------------
+
+    /// Approval handler that always denies with a fixed reason.
+    struct AlwaysDeny(&'static str);
+    #[async_trait]
+    impl ApprovalHandler for AlwaysDeny {
+        async fn approve(&self, _: &str, _: &Value, _: ToolClass) -> ApprovalDecision {
+            ApprovalDecision::Deny(self.0.to_string())
+        }
+    }
+
+    /// Approval handler that takes 10s before answering — used to
+    /// prove cancellation interrupts a hung approval.
+    struct SlowApproval;
+    #[async_trait]
+    impl ApprovalHandler for SlowApproval {
+        async fn approve(&self, _: &str, _: &Value, _: ToolClass) -> ApprovalDecision {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            ApprovalDecision::Allow
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_deny_emits_error_tool_result_and_skips_execution() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_clone = Arc::clone(&ran);
+
+        struct ObservingTool(Arc<std::sync::atomic::AtomicBool>);
+        #[async_trait]
+        impl Tool for ObservingTool {
+            fn name(&self) -> &str {
+                "observe"
+            }
+            fn description(&self) -> &str {
+                "observes whether it ran"
+            }
+            fn input_schema(&self) -> Value {
+                json!({})
+            }
+            async fn execute(&self, _: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(ToolOutput::text("ran"))
+            }
+        }
+
+        let reg = Arc::new(ToolRegistry::new(vec![Arc::new(ObservingTool(ran_clone))]));
+        let exec = ToolExecutor::with_approval(
+            reg,
+            Arc::new(AllowAll),
+            Arc::new(AlwaysDeny("blocked by user")),
+        );
+        let res = exec.execute_one(call("observe", json!({})), &ctx()).await;
+        let Content::ToolResult {
+            content, is_error, ..
+        } = res
+        else {
+            panic!("expected tool_result");
+        };
+
+        assert!(is_error, "denied call should yield is_error: true");
+        assert!(
+            content.contains("approval denied"),
+            "content should mark approval denial, got: {content}"
+        );
+        assert!(
+            content.contains("blocked by user"),
+            "content should preserve the deny reason, got: {content}"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "tool must NOT have executed after approval denial"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_cancel_during_approve_short_circuits() {
+        let reg = Arc::new(ToolRegistry::new(vec![Arc::new(Echo)]));
+        let exec = ToolExecutor::with_approval(reg, Arc::new(AllowAll), Arc::new(SlowApproval));
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolContext {
+            working_dir: PathBuf::from("/tmp"),
+            cancel: cancel.clone(),
+            depth: 0,
+            max_depth: 1,
+            executor: empty_executor(),
+        };
+
+        // Fire cancel after 50ms; SlowApproval would take 10s otherwise.
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let res = exec
+            .execute_one(call("echo", json!({"msg": "x"})), &ctx)
+            .await;
+        let elapsed = started.elapsed();
+
+        let Content::ToolResult {
+            content, is_error, ..
+        } = res
+        else {
+            panic!("expected tool_result");
+        };
+        assert!(is_error, "cancel during approval should yield is_error");
+        assert!(
+            content.contains("cancelled"),
+            "content should mention cancellation, got: {content}"
+        );
+        // Critical: the 10s SlowApproval future was racing the 50ms
+        // cancel. With biased select! on cancel-first, we must beat
+        // 10s by an order of magnitude. 1s is comfortable slack.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "cancel should win the race against approve(); took {elapsed:?}"
         );
     }
 }
