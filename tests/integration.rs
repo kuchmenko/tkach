@@ -11,7 +11,8 @@ use agent_runtime::message::{Content, Message};
 use agent_runtime::provider::Request;
 use agent_runtime::providers::{Anthropic, OpenAICompatible};
 use agent_runtime::tools::SubAgent;
-use agent_runtime::{Agent, AgentResult, CancellationToken, LlmProvider};
+use agent_runtime::{Agent, AgentResult, CancellationToken, LlmProvider, StreamEvent};
+use futures::StreamExt;
 
 /// Load `.env` once per test process. `cargo test` runs every `#[test]` on
 /// the same process by default, so the `Once` ensures a single load.
@@ -512,5 +513,74 @@ async fn smoke_openai_compatible_roundtrip() {
     assert!(
         text.to_uppercase().contains("PONG"),
         "expected PONG in response, got: {text:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic streaming smoke (real SSE round-trip)
+// ---------------------------------------------------------------------------
+
+/// Streams a PING/PONG response through the Anthropic SSE pipeline.
+/// Validates: bearer auth via `x-api-key`, `stream: true` switching the
+/// transport, our SSE state machine progressing through `message_start`
+/// → `content_block_*` → `message_delta` → `message_stop`, and the
+/// final assembled text matching what `complete()` would have returned.
+#[tokio::test]
+#[ignore]
+async fn smoke_anthropic_stream_roundtrip() {
+    load_env();
+    let provider = require_api_key();
+
+    let request = Request {
+        model: "claude-haiku-4-5-20251001".into(),
+        system: Some("Reply with exactly: PONG".into()),
+        messages: vec![Message::user_text("PING")],
+        tools: vec![],
+        max_tokens: 32,
+        temperature: Some(0.0),
+    };
+
+    let mut stream = provider.stream(request).await.expect("open stream");
+    let mut text = String::new();
+    let mut delta_count = 0usize;
+    let mut got_message_delta = false;
+    let mut got_done = false;
+    let mut input_tokens = 0u32;
+    let mut output_tokens = 0u32;
+
+    while let Some(event) = stream.next().await {
+        let ev = event.expect("event ok");
+        match ev {
+            StreamEvent::ContentDelta(t) => {
+                delta_count += 1;
+                text.push_str(&t);
+            }
+            StreamEvent::ToolUse { .. } => panic!("no tools in this prompt"),
+            StreamEvent::MessageDelta { .. } => got_message_delta = true,
+            StreamEvent::Usage(u) => {
+                if u.input_tokens > 0 {
+                    input_tokens = u.input_tokens;
+                }
+                if u.output_tokens > 0 {
+                    output_tokens = u.output_tokens;
+                }
+            }
+            StreamEvent::Done => got_done = true,
+        }
+    }
+
+    eprintln!(
+        "[smoke anthropic stream] deltas={delta_count} \
+         in={input_tokens} out={output_tokens} text={text:?}"
+    );
+
+    assert!(delta_count >= 1, "should have received at least one delta");
+    assert!(got_message_delta, "should have received MessageDelta");
+    assert!(got_done, "should have received Done terminal");
+    assert!(input_tokens > 0, "should have prompt tokens");
+    assert!(output_tokens > 0, "should have completion tokens");
+    assert!(
+        text.to_uppercase().contains("PONG"),
+        "expected PONG in assembled text, got: {text:?}"
     );
 }
