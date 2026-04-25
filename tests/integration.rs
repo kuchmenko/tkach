@@ -444,9 +444,18 @@ async fn full_agent_create_and_modify() {
 #[ignore]
 async fn smoke_openai_compatible_roundtrip() {
     load_env();
-    let Ok(api_key) = std::env::var("OPENAI_API_KEY") else {
-        eprintln!("skipping smoke_openai_compatible_roundtrip: OPENAI_API_KEY not set");
-        return;
+    // Skip if the var is unset, empty, or still the .env.example placeholder.
+    // Without these checks the provider would round-trip a bogus key into
+    // a 401 from the upstream and look like a real failure.
+    let api_key = match std::env::var("OPENAI_API_KEY") {
+        Ok(k) if !k.is_empty() && !k.starts_with("sk-...") => k,
+        _ => {
+            eprintln!(
+                "skipping smoke_openai_compatible_roundtrip: \
+                 OPENAI_API_KEY missing, empty, or still the placeholder"
+            );
+            return;
+        }
     };
 
     let base_url = std::env::var("OPENAI_BASE_URL")
