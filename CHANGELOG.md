@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/kuchmenko/agent-runtime/compare/agent-runtime-v0.1.1...agent-runtime-v0.2.0) (2026-04-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* `ToolContext` loses provider/model/max_turns/ max_tokens/temperature/agent_depth/max_agent_depth; gains `depth`, `max_depth`, `executor`. `SubAgent` is no longer a unit struct — construct via `SubAgent::new(provider, model)` and configure with `.system()`, `.max_turns()`, etc. `AgentBuilder::max_agent_depth` renamed to `max_depth`.
+* `ToolContext` gains the required `cancel` field; direct constructions must supply it. `ToolError::Cancelled` variant added.
+* none at the API level (execute_one still exists), but observable concurrency semantics change — callers that rely on sequential execution of consecutive read-only tools must reclassify them to `Mutating`.
+* `tools::defaults()` returns `Vec<Arc<dyn Tool>>` (was `Vec<Box<dyn Tool>>`); `tools::all()` removed; `AgentBuilder::tools` signature changed to match.
+* `Tool` trait gains a `class()` method (defaulted, so existing implementations compile; override if the tool is read-only).
+* `Agent::run(&str)` replaced by `Agent::run(Vec<Message>, CancellationToken)`; `AgentResult::messages` renamed to `new_messages` and now holds only the delta; `AgentError::MaxTurnsReached(usize)` and
+* `StopReason` gains three variants — exhaustive `match` patterns on it must be updated.
+* `ProviderError::Api` gains a `retryable: bool` field; two new variants added.
+
+### Features
+
+* add integration tests with real Anthropic API ([35fd5d3](https://github.com/kuchmenko/agent-runtime/commit/35fd5d35721616856f27be591cd4cb9c3a40f70d))
+* add OpenAI-compatible provider (non-streaming, API-key) ([37fdfef](https://github.com/kuchmenko/agent-runtime/commit/37fdfef3e15ada9e788e7a93c96467124132db19))
+* add Tool::class() to classify side effects ([6ae797f](https://github.com/kuchmenko/agent-runtime/commit/6ae797fac1d8864612f5938cab5a269f74962f10))
+* Agent::stream + AgentStream handle ([668b6cb](https://github.com/kuchmenko/agent-runtime/commit/668b6cb5304ae0de7bccc22482ff5b9f2a675e47))
+* Agent::stream emits ToolCallPending before approval gate ([4adb3bc](https://github.com/kuchmenko/agent-runtime/commit/4adb3bcc13d023b5874247a6dd8f22764acceb7a))
+* AgentBuilder::approval + StreamEvent::ToolCallPending variant ([198aef9](https://github.com/kuchmenko/agent-runtime/commit/198aef9eb459683c09472dcd301c0aaee7c0cd04))
+* approval flow — ApprovalHandler, ToolCallPending events, cancel-aware gate ([e67ccec](https://github.com/kuchmenko/agent-runtime/commit/e67ccec0b6760a1e307f8671c7a26da7289f59fe))
+* ApprovalHandler trait + AutoApprove default ([f0322bc](https://github.com/kuchmenko/agent-runtime/commit/f0322bc44e8f4db1a56057d6cdcd631226ccdfb1))
+* classify ProviderError for retry decisions ([013e335](https://github.com/kuchmenko/agent-runtime/commit/013e33532fd1fa12c1a2a997f4b76dabc7222daf))
+* implement Anthropic SSE streaming ([2dbf9be](https://github.com/kuchmenko/agent-runtime/commit/2dbf9be436cbbc3511110c66e311d3adb52aa630))
+* implement OpenAI-compatible SSE streaming ([1c8a917](https://github.com/kuchmenko/agent-runtime/commit/1c8a91714605c18b195e83a7a6c62ba05e065a21))
+* introduce StreamEvent and LlmProvider::stream ([5249fc0](https://github.com/kuchmenko/agent-runtime/commit/5249fc0f86fe9f811934b3cf9d26d1c7cd2d475d))
+* introduce ToolRegistry, ToolExecutor, ToolPolicy ([6ddf009](https://github.com/kuchmenko/agent-runtime/commit/6ddf009a846a70f63907daa3540d7b476249b2e5))
+* make Agent::run stateless with CancellationToken ([bd3d83d](https://github.com/kuchmenko/agent-runtime/commit/bd3d83d3993c75c1e9cea5a50320d86a3f79fc68))
+* parallelise read-only tool batches in execute_batch ([b8a22d1](https://github.com/kuchmenko/agent-runtime/commit/b8a22d1658c032579957be167065951bd10ec8b6))
+* propagate cancellation through ctx into Bash/WebFetch ([adde3b6](https://github.com/kuchmenko/agent-runtime/commit/adde3b645fa645a96bc4324b278b30133ba203a9))
+* rework SubAgent to Model 3 (stateful, executor via ctx) ([abeb778](https://github.com/kuchmenko/agent-runtime/commit/abeb778c8df15bdcf6d44a9eab2cf5923d186ae3))
+* streaming — StreamEvent, Agent::stream, real SSE for Anthropic and OpenAI-compat ([9b11cff](https://github.com/kuchmenko/agent-runtime/commit/9b11cffa8d4d841519541d27cfe5f3a1abbb74c1))
+* ToolExecutor approval gate with cancel-aware select! ([a7748d0](https://github.com/kuchmenko/agent-runtime/commit/a7748d03424695571f0480157c0613c6f4e3381c))
+* widen StopReason with StopSequence, PauseTurn, Cancelled ([1611ece](https://github.com/kuchmenko/agent-runtime/commit/1611ece32bb9e45ec5f3b3258b156ab9b90ac8e2))
+
+
+### Bug Fixes
+
+* cancel mid-stream and four end-to-end verification examples ([ae96069](https://github.com/kuchmenko/agent-runtime/commit/ae960698f401d773b9ad34b7a4faffeb44925124))
+* integration test exhaustive match for StreamEvent::ToolCallPending ([872f4a6](https://github.com/kuchmenko/agent-runtime/commit/872f4a627650869b69dcabe9f4f5d6ed51824d7e))
+* OpenAI-compat wire correctness + narrow Http retryability (P2) ([7b73de4](https://github.com/kuchmenko/agent-runtime/commit/7b73de4d0c45278b7a3a56632ec8c8245e271950))
+* stop dispatching tools after cancellation fires (P1) ([e71ee2b](https://github.com/kuchmenko/agent-runtime/commit/e71ee2b6cb2a0a68f63239b7d21ee46b19f8b5f0))
+
 ## [0.1.1](https://github.com/kuchmenko/agent-runtime/compare/agent-runtime-v0.1.0...agent-runtime-v0.1.1) (2026-04-05)
 
 
