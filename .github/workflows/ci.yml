@@ -23,13 +23,31 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: clippy-sarif,sarif-fmt
+      - name: Run clippy with SARIF output
+        run: |
+          cargo clippy --all-targets --message-format=json \
+            | clippy-sarif \
+            | tee clippy.sarif \
+            | sarif-fmt
+      - name: Upload SARIF to GitHub Code Scanning
+        if: success() || failure()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: clippy.sarif
+          wait-for-processing: true
+          category: clippy
 
   test:
     name: Test
