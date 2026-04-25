@@ -643,3 +643,63 @@ async fn smoke_openai_compatible_stream_roundtrip() {
         "expected PONG in assembled text, got: {text:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Agent::stream end-to-end smoke (real Anthropic, full loop)
+// ---------------------------------------------------------------------------
+
+/// Drives a complete agent run through `Agent::stream` against the
+/// Anthropic API. Validates: live `ContentDelta` events, atomic
+/// `ToolUse` events, the agent loop assembling deltas into a single
+/// `Content::Text` for history, and `into_result` returning a normal
+/// `AgentResult` with non-zero usage.
+#[tokio::test]
+#[ignore]
+async fn smoke_agent_stream_end_to_end() {
+    load_env();
+    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+        panic!("ANTHROPIC_API_KEY required");
+    }
+
+    let dir = temp_dir("smoke_agent_stream");
+    std::fs::write(dir.join("note.txt"), "The codeword is BANANA.").unwrap();
+
+    let agent = haiku_agent(&dir);
+
+    let mut stream = agent.stream(
+        prompt("Read the file note.txt and tell me the codeword. Be brief."),
+        CancellationToken::new(),
+    );
+
+    let mut delta_count = 0usize;
+    let mut tool_uses = Vec::new();
+    while let Some(ev) = stream.next().await {
+        match ev.expect("stream event") {
+            StreamEvent::ContentDelta(_) => delta_count += 1,
+            StreamEvent::ToolUse { name, .. } => tool_uses.push(name),
+            _ => {}
+        }
+    }
+    let result = stream.into_result().await.expect("agent stream result");
+
+    eprintln!(
+        "[smoke agent stream] deltas={delta_count} tools={tool_uses:?} \
+         in={} out={} text={:?}",
+        result.usage.input_tokens, result.usage.output_tokens, result.text
+    );
+
+    assert!(delta_count >= 1, "should have streamed at least one delta");
+    assert!(
+        tool_uses.iter().any(|n| n == "read"),
+        "agent should have called the read tool"
+    );
+    assert!(
+        result.text.contains("BANANA"),
+        "final text should contain the codeword: {:?}",
+        result.text
+    );
+    assert!(
+        result.usage.input_tokens > 0 && result.usage.output_tokens > 0,
+        "usage should have non-zero counts"
+    );
+}
