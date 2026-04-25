@@ -11,7 +11,8 @@ use agent_runtime::message::{Content, Message};
 use agent_runtime::provider::Request;
 use agent_runtime::providers::{Anthropic, OpenAICompatible};
 use agent_runtime::tools::SubAgent;
-use agent_runtime::{Agent, AgentResult, CancellationToken, LlmProvider};
+use agent_runtime::{Agent, AgentResult, CancellationToken, LlmProvider, StreamEvent};
+use futures::StreamExt;
 
 /// Load `.env` once per test process. `cargo test` runs every `#[test]` on
 /// the same process by default, so the `Once` ensures a single load.
@@ -512,5 +513,193 @@ async fn smoke_openai_compatible_roundtrip() {
     assert!(
         text.to_uppercase().contains("PONG"),
         "expected PONG in response, got: {text:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic streaming smoke (real SSE round-trip)
+// ---------------------------------------------------------------------------
+
+/// Streams a PING/PONG response through the Anthropic SSE pipeline.
+/// Validates: bearer auth via `x-api-key`, `stream: true` switching the
+/// transport, our SSE state machine progressing through `message_start`
+/// → `content_block_*` → `message_delta` → `message_stop`, and the
+/// final assembled text matching what `complete()` would have returned.
+#[tokio::test]
+#[ignore]
+async fn smoke_anthropic_stream_roundtrip() {
+    load_env();
+    let provider = require_api_key();
+
+    let request = Request {
+        model: "claude-haiku-4-5-20251001".into(),
+        system: Some("Reply with exactly: PONG".into()),
+        messages: vec![Message::user_text("PING")],
+        tools: vec![],
+        max_tokens: 32,
+        temperature: Some(0.0),
+    };
+
+    let mut stream = provider.stream(request).await.expect("open stream");
+    let mut text = String::new();
+    let mut delta_count = 0usize;
+    let mut got_message_delta = false;
+    let mut got_done = false;
+    let mut input_tokens = 0u32;
+    let mut output_tokens = 0u32;
+
+    while let Some(event) = stream.next().await {
+        let ev = event.expect("event ok");
+        match ev {
+            StreamEvent::ContentDelta(t) => {
+                delta_count += 1;
+                text.push_str(&t);
+            }
+            StreamEvent::ToolUse { .. } => panic!("no tools in this prompt"),
+            StreamEvent::MessageDelta { .. } => got_message_delta = true,
+            StreamEvent::Usage(u) => {
+                if u.input_tokens > 0 {
+                    input_tokens = u.input_tokens;
+                }
+                if u.output_tokens > 0 {
+                    output_tokens = u.output_tokens;
+                }
+            }
+            StreamEvent::Done => got_done = true,
+        }
+    }
+
+    eprintln!(
+        "[smoke anthropic stream] deltas={delta_count} \
+         in={input_tokens} out={output_tokens} text={text:?}"
+    );
+
+    assert!(delta_count >= 1, "should have received at least one delta");
+    assert!(got_message_delta, "should have received MessageDelta");
+    assert!(got_done, "should have received Done terminal");
+    assert!(input_tokens > 0, "should have prompt tokens");
+    assert!(output_tokens > 0, "should have completion tokens");
+    assert!(
+        text.to_uppercase().contains("PONG"),
+        "expected PONG in assembled text, got: {text:?}"
+    );
+}
+
+/// Streams a PING/PONG response through any OpenAI-compatible endpoint.
+/// Same opportunistic-skip semantics as the non-streaming OpenAI smoke.
+#[tokio::test]
+#[ignore]
+async fn smoke_openai_compatible_stream_roundtrip() {
+    load_env();
+    let api_key = match std::env::var("OPENAI_API_KEY") {
+        Ok(k) if !k.is_empty() && !k.starts_with("sk-...") => k,
+        _ => {
+            eprintln!(
+                "skipping smoke_openai_compatible_stream_roundtrip: \
+                 OPENAI_API_KEY missing, empty, or still the placeholder"
+            );
+            return;
+        }
+    };
+
+    let base_url = std::env::var("OPENAI_BASE_URL")
+        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let model = std::env::var("OPENAI_SMOKE_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+
+    let provider = OpenAICompatible::new(api_key).with_base_url(base_url);
+
+    let request = Request {
+        model: model.clone(),
+        system: Some("Reply with exactly the single word: PONG".into()),
+        messages: vec![Message::user_text("PING")],
+        tools: vec![],
+        max_tokens: 256,
+        temperature: Some(0.0),
+    };
+
+    let mut stream = provider.stream(request).await.expect("open stream");
+    let mut text = String::new();
+    let mut delta_count = 0usize;
+    let mut got_done = false;
+
+    while let Some(event) = stream.next().await {
+        match event.expect("event ok") {
+            StreamEvent::ContentDelta(t) => {
+                delta_count += 1;
+                text.push_str(&t);
+            }
+            StreamEvent::ToolUse { .. } => panic!("no tools in this prompt"),
+            StreamEvent::Done => got_done = true,
+            _ => {}
+        }
+    }
+
+    eprintln!("[smoke openai-compat stream | model={model}] deltas={delta_count} text={text:?}");
+
+    assert!(got_done, "should have received Done terminal");
+    assert!(delta_count >= 1, "should have received at least one delta");
+    assert!(
+        text.to_uppercase().contains("PONG"),
+        "expected PONG in assembled text, got: {text:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Agent::stream end-to-end smoke (real Anthropic, full loop)
+// ---------------------------------------------------------------------------
+
+/// Drives a complete agent run through `Agent::stream` against the
+/// Anthropic API. Validates: live `ContentDelta` events, atomic
+/// `ToolUse` events, the agent loop assembling deltas into a single
+/// `Content::Text` for history, and `into_result` returning a normal
+/// `AgentResult` with non-zero usage.
+#[tokio::test]
+#[ignore]
+async fn smoke_agent_stream_end_to_end() {
+    load_env();
+    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+        panic!("ANTHROPIC_API_KEY required");
+    }
+
+    let dir = temp_dir("smoke_agent_stream");
+    std::fs::write(dir.join("note.txt"), "The codeword is BANANA.").unwrap();
+
+    let agent = haiku_agent(&dir);
+
+    let mut stream = agent.stream(
+        prompt("Read the file note.txt and tell me the codeword. Be brief."),
+        CancellationToken::new(),
+    );
+
+    let mut delta_count = 0usize;
+    let mut tool_uses = Vec::new();
+    while let Some(ev) = stream.next().await {
+        match ev.expect("stream event") {
+            StreamEvent::ContentDelta(_) => delta_count += 1,
+            StreamEvent::ToolUse { name, .. } => tool_uses.push(name),
+            _ => {}
+        }
+    }
+    let result = stream.into_result().await.expect("agent stream result");
+
+    eprintln!(
+        "[smoke agent stream] deltas={delta_count} tools={tool_uses:?} \
+         in={} out={} text={:?}",
+        result.usage.input_tokens, result.usage.output_tokens, result.text
+    );
+
+    assert!(delta_count >= 1, "should have streamed at least one delta");
+    assert!(
+        tool_uses.iter().any(|n| n == "read"),
+        "agent should have called the read tool"
+    );
+    assert!(
+        result.text.contains("BANANA"),
+        "final text should contain the codeword: {:?}",
+        result.text
+    );
+    assert!(
+        result.usage.input_tokens > 0 && result.usage.output_tokens > 0,
+        "usage should have non-zero counts"
     );
 }

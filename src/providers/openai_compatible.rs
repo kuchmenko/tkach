@@ -17,13 +17,18 @@
 //!    carrying multiple `ToolResult` blocks fans out into N messages on
 //!    the wire.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
+use eventsource_stream::Eventsource;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ProviderError;
 use crate::message::{Content, Message, Role, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, Response};
+use crate::stream::{ProviderEventStream, StreamEvent};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -62,6 +67,36 @@ impl OpenAICompatible {
 
 #[async_trait]
 impl LlmProvider for OpenAICompatible {
+    async fn stream(&self, request: Request) -> Result<ProviderEventStream, ProviderError> {
+        let mut body = build_request_body(&request);
+        body.stream = true;
+        body.stream_options = Some(StreamOptions {
+            include_usage: true,
+        });
+        let url = format!("{}/chat/completions", self.base_url);
+
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status().as_u16();
+
+        if status >= 400 {
+            let retry_after_ms = parse_retry_after(response.headers());
+            let text = response.text().await.unwrap_or_default();
+            return Err(classify_error(status, text, retry_after_ms));
+        }
+
+        let event_stream = response.bytes_stream().eventsource();
+        Ok(Box::pin(openai_event_stream(event_stream)))
+    }
+
     async fn complete(&self, request: Request) -> Result<Response, ProviderError> {
         let body = build_request_body(&request);
         let url = format!("{}/chat/completions", self.base_url);
@@ -127,6 +162,19 @@ struct ApiRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// `stream: true` switches the response to SSE; default false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
+    /// `stream_options.include_usage: true` requests usage in the final
+    /// chunk; without this OpenAI omits usage entirely from streamed
+    /// responses (only complete() carries it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]
@@ -259,6 +307,8 @@ fn build_request_body(request: &Request) -> ApiRequest {
         tools,
         max_tokens: Some(request.max_tokens),
         temperature: request.temperature,
+        stream: false,
+        stream_options: None,
     }
 }
 
@@ -427,6 +477,252 @@ fn convert_response(api: ApiResponse) -> Result<Response, ProviderError> {
         stop_reason,
         usage,
     })
+}
+
+// --- Streaming SSE state machine ---
+//
+// OpenAI's SSE format is simpler than Anthropic's: every line is just
+// `data: <json>\n` (no `event:` field), terminated by a literal
+// `data: [DONE]\n`. Each chunk's `choices[0].delta` carries either a
+// piece of `content` (text), or one or more `tool_calls[]` entries.
+//
+// Tool calls accumulate across chunks. The first chunk for a given
+// tool slot carries `id`, `type: "function"`, and `function.name`;
+// subsequent chunks carry only `function.arguments` deltas. We index
+// by the `index` field (or fall back to position) and emit one atomic
+// `StreamEvent::ToolUse` per slot on `finish_reason: tool_calls`.
+//
+// Usage arrives in the final chunk only when the request was sent
+// with `stream_options.include_usage: true`.
+
+#[derive(Deserialize)]
+struct ChatChunk {
+    #[serde(default)]
+    choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<ChunkUsage>,
+}
+
+#[derive(Deserialize)]
+struct ChatChoice {
+    #[serde(default)]
+    delta: ChatDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ChatDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCallChunk>,
+}
+
+#[derive(Deserialize)]
+struct ToolCallChunk {
+    /// Index identifies the tool slot. May be missing in malformed
+    /// streams; we fall back to insertion order in that case.
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<ToolCallFunctionChunk>,
+}
+
+#[derive(Deserialize, Default)]
+struct ToolCallFunctionChunk {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChunkUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+}
+
+#[derive(Default)]
+struct ToolSlot {
+    id: String,
+    name: String,
+    args_buf: String,
+}
+
+/// State carried across `unfold` polls. Factored out to satisfy
+/// clippy::type_complexity and document each slot's role.
+struct StreamState<S> {
+    sse: S,
+    /// Per-tool-slot accumulator keyed by `index` (BTreeMap to preserve
+    /// LLM-issued order on flush).
+    slots: BTreeMap<usize, ToolSlot>,
+    /// Latest non-`null` `finish_reason` seen on a chunk.
+    pending_stop: Option<StopReason>,
+    /// Pre-emit buffer; one SSE chunk can produce multiple StreamEvents.
+    buffer: std::collections::VecDeque<Result<StreamEvent, ProviderError>>,
+    /// True after we have emitted the synthetic `Done` terminal — used
+    /// to short-circuit further `next()` calls so consumers see `None`.
+    emitted_done: bool,
+}
+
+fn openai_event_stream<S>(sse: S) -> impl futures::Stream<Item = Result<StreamEvent, ProviderError>>
+where
+    S: futures::Stream<
+            Item = Result<
+                eventsource_stream::Event,
+                eventsource_stream::EventStreamError<reqwest::Error>,
+            >,
+        > + Send
+        + Unpin
+        + 'static,
+{
+    use std::collections::VecDeque;
+
+    let initial = StreamState {
+        sse,
+        slots: BTreeMap::new(),
+        pending_stop: None,
+        buffer: VecDeque::new(),
+        emitted_done: false,
+    };
+
+    futures::stream::unfold(initial, |mut state| async move {
+        loop {
+            if let Some(ev) = state.buffer.pop_front() {
+                return Some((ev, state));
+            }
+
+            if state.emitted_done {
+                return None;
+            }
+
+            let next = state.sse.next().await;
+            let event = match next {
+                None => {
+                    // Stream ended without a `data: [DONE]`. Flush any
+                    // pending tool slots + stop reason + Done.
+                    flush_terminal(&mut state.slots, &mut state.pending_stop, &mut state.buffer);
+                    if state.buffer.is_empty() {
+                        return None;
+                    }
+                    state.emitted_done = true;
+                    continue;
+                }
+                Some(Ok(ev)) => ev,
+                Some(Err(e)) => {
+                    let err = ProviderError::Other(format!("SSE read error: {e}"));
+                    return Some((Err(err), state));
+                }
+            };
+
+            let data = event.data.trim();
+            if data == "[DONE]" {
+                flush_terminal(&mut state.slots, &mut state.pending_stop, &mut state.buffer);
+                state.emitted_done = true;
+                continue;
+            }
+            if data.is_empty() {
+                continue;
+            }
+
+            let chunk: ChatChunk = match serde_json::from_str(data) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            process_chunk(
+                chunk,
+                &mut state.slots,
+                &mut state.pending_stop,
+                &mut state.buffer,
+            );
+        }
+    })
+}
+
+fn process_chunk(
+    chunk: ChatChunk,
+    slots: &mut BTreeMap<usize, ToolSlot>,
+    pending_stop: &mut Option<StopReason>,
+    buffer: &mut std::collections::VecDeque<Result<StreamEvent, ProviderError>>,
+) {
+    if let Some(choice) = chunk.choices.into_iter().next() {
+        if let Some(text) = choice.delta.content {
+            if !text.is_empty() {
+                buffer.push_back(Ok(StreamEvent::ContentDelta(text)));
+            }
+        }
+        for tc in choice.delta.tool_calls {
+            let idx = tc.index.unwrap_or(slots.len());
+            let slot = slots.entry(idx).or_default();
+            if let Some(id) = tc.id {
+                slot.id = id;
+            }
+            if let Some(f) = tc.function {
+                if let Some(name) = f.name {
+                    slot.name = name;
+                }
+                if let Some(args) = f.arguments {
+                    slot.args_buf.push_str(&args);
+                }
+            }
+        }
+        if let Some(reason) = choice.finish_reason {
+            *pending_stop = Some(map_finish_reason(&reason));
+        }
+    }
+
+    if let Some(usage) = chunk.usage {
+        buffer.push_back(Ok(StreamEvent::Usage(Usage {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+        })));
+    }
+}
+
+/// Flush accumulated tool slots into atomic ToolUse events, then emit
+/// pending MessageDelta and Done. Called on `[DONE]` or stream end.
+fn flush_terminal(
+    slots: &mut BTreeMap<usize, ToolSlot>,
+    pending_stop: &mut Option<StopReason>,
+    buffer: &mut std::collections::VecDeque<Result<StreamEvent, ProviderError>>,
+) {
+    // BTreeMap iteration is index-sorted, preserving LLM-issued order.
+    for (_, slot) in std::mem::take(slots) {
+        if slot.id.is_empty() && slot.name.is_empty() {
+            continue;
+        }
+        let input: Value = if slot.args_buf.trim().is_empty() {
+            Value::Object(Default::default())
+        } else {
+            serde_json::from_str(&slot.args_buf).unwrap_or(Value::Object(Default::default()))
+        };
+        buffer.push_back(Ok(StreamEvent::ToolUse {
+            id: slot.id,
+            name: slot.name,
+            input,
+        }));
+    }
+    if let Some(stop) = pending_stop.take() {
+        buffer.push_back(Ok(StreamEvent::MessageDelta { stop_reason: stop }));
+    }
+    buffer.push_back(Ok(StreamEvent::Done));
+}
+
+fn map_finish_reason(reason: &str) -> StopReason {
+    match reason {
+        "stop" => StopReason::EndTurn,
+        "tool_calls" | "function_call" => StopReason::ToolUse,
+        "length" => StopReason::MaxTokens,
+        "content_filter" => StopReason::EndTurn,
+        "stop_sequence" => StopReason::StopSequence,
+        _ => StopReason::EndTurn,
+    }
 }
 
 #[cfg(test)]

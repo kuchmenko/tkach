@@ -1,13 +1,21 @@
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use futures::Stream;
+use futures::StreamExt;
+use serde_json::Value;
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::error::AgentError;
+use crate::error::{AgentError, ProviderError};
 use crate::executor::{AllowAll, ToolCall, ToolExecutor, ToolPolicy, ToolRegistry};
 use crate::message::{Content, Message, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, ToolDefinition};
+use crate::stream::StreamEvent;
 use crate::tool::{Tool, ToolContext};
 
 /// Fallback `stop_reason` for partial results returned before any turn
@@ -52,6 +60,10 @@ pub struct AgentResult {
 /// requested tools via the [`ToolExecutor`], feeds results back, and
 /// repeats until the LLM produces a final text response, max turns are
 /// reached, or the caller cancels.
+///
+/// `Clone` is shallow (Arcs and small primitives) — cheap; used by
+/// [`Agent::stream`] to move a copy into the background task.
+#[derive(Clone)]
 pub struct Agent {
     provider: Arc<dyn LlmProvider>,
     model: String,
@@ -240,6 +252,346 @@ impl Agent {
                 last_stop.unwrap_or(FALLBACK_STOP_REASON),
                 "",
             ),
+        })
+    }
+
+    /// Run the agent loop in streaming mode.
+    ///
+    /// Returns immediately with an [`AgentStream`] handle. A background
+    /// task is spawned (under the current Tokio runtime) that drives the
+    /// loop, calling `provider.stream()` on each turn. As the model
+    /// produces text, [`StreamEvent::ContentDelta`] arrives through the
+    /// stream live; [`StreamEvent::ToolUse`] arrives atomically when the
+    /// model finishes a tool block. Provider-internal events
+    /// (`MessageDelta`, `Usage`, per-turn `Done`) are absorbed —
+    /// consumers see only what they can render to the user.
+    ///
+    /// History accumulation happens silently: text deltas are joined
+    /// into a single `Content::Text` block per turn before being added
+    /// to `new_messages`, so the next turn's request to the provider
+    /// sees a clean conversation history.
+    ///
+    /// Call [`AgentStream::into_result`] (or `.collect_result()`) after
+    /// the stream ends to receive the final [`AgentResult`] with
+    /// `new_messages`, `text`, `usage`, and `stop_reason` — exactly the
+    /// shape `run()` returns. Backpressure is provided by a bounded
+    /// `mpsc(16)` channel: a slow consumer parks the producer task,
+    /// which transitively parks the SSE reader, which lets the OS
+    /// shrink the TCP receive window, all the way back to the LLM
+    /// server.
+    pub fn stream(&self, messages: Vec<Message>, cancel: CancellationToken) -> AgentStream {
+        let agent = self.clone();
+        let (events_tx, events_rx) = mpsc::channel::<Result<StreamEvent, ProviderError>>(16);
+        let (result_tx, result_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let result = agent.run_streaming_loop(messages, cancel, events_tx).await;
+            // If the consumer dropped before we finished, sending the
+            // result is a no-op; that's fine.
+            let _ = result_tx.send(result);
+        });
+
+        AgentStream {
+            events_rx: ReceiverStream::new(events_rx),
+            result_rx: Some(result_rx),
+        }
+    }
+
+    /// Body of the streaming loop. Owns the task locally so the public
+    /// API surface stays small. Mirrors `run()` structurally — same
+    /// turn counter, same cancel checkpoints, same history shape — but
+    /// the per-turn provider call yields a stream rather than a
+    /// buffered Response.
+    async fn run_streaming_loop(
+        self,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+        events_tx: mpsc::Sender<Result<StreamEvent, ProviderError>>,
+    ) -> Result<AgentResult, AgentError> {
+        let mut history = messages;
+        let mut new_messages: Vec<Message> = Vec::new();
+        let mut total_usage = Usage::default();
+        let mut last_stop: Option<StopReason> = None;
+
+        let tool_defs = self.tool_definitions();
+        let ctx = self.make_context(cancel.clone());
+
+        for turn in 0..self.max_turns {
+            info!(turn, "agent stream turn");
+
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled {
+                    partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
+                });
+            }
+
+            let request = Request {
+                model: self.model.clone(),
+                system: self.system.clone(),
+                messages: history.clone(),
+                tools: tool_defs.clone(),
+                max_tokens: self.max_tokens,
+                temperature: self.temperature,
+            };
+
+            let mut provider_stream = match self.provider.stream(request).await {
+                Ok(s) => s,
+                Err(source) => {
+                    return Err(AgentError::Provider {
+                        source,
+                        partial: build_partial(
+                            &new_messages,
+                            &total_usage,
+                            last_stop.unwrap_or(FALLBACK_STOP_REASON),
+                            "",
+                        ),
+                    });
+                }
+            };
+
+            // Per-turn accumulators. Text deltas concatenate into a
+            // single Text block; tool_uses preserve LLM-issued order.
+            let mut text_buf = String::new();
+            let mut tool_uses: Vec<(String, String, Value)> = Vec::new();
+            let mut turn_stop: Option<StopReason> = None;
+            let mut turn_usage = Usage::default();
+
+            // Inner SSE loop. We cannot use `while let Some(event) =
+            // provider_stream.next().await` here because that blocks
+            // until the next SSE chunk arrives and gives the cancel
+            // token no chance to interrupt — a long generation would
+            // run to completion ignoring `cancel.cancel()`. Instead
+            // race each pull against the cancel future so external
+            // cancellation aborts immediately, dropping
+            // `provider_stream` (which closes the reqwest socket on
+            // drop, terminating the SSE upstream).
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        return Err(AgentError::Cancelled {
+                            partial: build_partial(
+                                &new_messages,
+                                &total_usage,
+                                StopReason::Cancelled,
+                                &text_buf,
+                            ),
+                        });
+                    }
+                    next = provider_stream.next() => match next {
+                        Some(e) => e,
+                        None => break,
+                    },
+                };
+                let ev = match event {
+                    Ok(ev) => ev,
+                    Err(source) => {
+                        return Err(AgentError::Provider {
+                            source,
+                            partial: build_partial(
+                                &new_messages,
+                                &total_usage,
+                                last_stop.unwrap_or(FALLBACK_STOP_REASON),
+                                &text_buf,
+                            ),
+                        });
+                    }
+                };
+
+                match ev {
+                    StreamEvent::ContentDelta(delta) => {
+                        text_buf.push_str(&delta);
+                        if events_tx
+                            .send(Ok(StreamEvent::ContentDelta(delta)))
+                            .await
+                            .is_err()
+                        {
+                            // Consumer hung up — abort like a cancel.
+                            return Err(AgentError::Cancelled {
+                                partial: build_partial(
+                                    &new_messages,
+                                    &total_usage,
+                                    StopReason::Cancelled,
+                                    &text_buf,
+                                ),
+                            });
+                        }
+                    }
+                    StreamEvent::ToolUse { id, name, input } => {
+                        tool_uses.push((id.clone(), name.clone(), input.clone()));
+                        if events_tx
+                            .send(Ok(StreamEvent::ToolUse { id, name, input }))
+                            .await
+                            .is_err()
+                        {
+                            return Err(AgentError::Cancelled {
+                                partial: build_partial(
+                                    &new_messages,
+                                    &total_usage,
+                                    StopReason::Cancelled,
+                                    &text_buf,
+                                ),
+                            });
+                        }
+                    }
+                    StreamEvent::MessageDelta { stop_reason } => {
+                        turn_stop = Some(stop_reason);
+                    }
+                    StreamEvent::Usage(u) => {
+                        // Anthropic emits two Usage events (start with
+                        // input_tokens, end with output_tokens). Take
+                        // max so we keep both pieces.
+                        turn_usage.input_tokens = turn_usage.input_tokens.max(u.input_tokens);
+                        turn_usage.output_tokens = turn_usage.output_tokens.max(u.output_tokens);
+                    }
+                    StreamEvent::Done => break,
+                }
+            }
+            // Drop provider_stream to free the underlying HTTP
+            // connection before the next turn opens a new one.
+            drop(provider_stream);
+
+            total_usage.input_tokens += turn_usage.input_tokens;
+            total_usage.output_tokens += turn_usage.output_tokens;
+            let resolved_stop = turn_stop.unwrap_or(StopReason::EndTurn);
+            last_stop = Some(resolved_stop);
+
+            // Build assistant message: text first (single joined block),
+            // then tool_use blocks in LLM-issued order. Mirrors how
+            // Anthropic's complete() returns content.
+            let mut assistant_content: Vec<Content> = Vec::new();
+            if !text_buf.is_empty() {
+                assistant_content.push(Content::Text {
+                    text: text_buf.clone(),
+                });
+            }
+            for (id, name, input) in &tool_uses {
+                assistant_content.push(Content::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                });
+            }
+            let assistant_msg = Message::assistant(assistant_content);
+            history.push(assistant_msg.clone());
+            new_messages.push(assistant_msg);
+
+            if tool_uses.is_empty() || resolved_stop == StopReason::EndTurn {
+                info!(turn, "agent stream finished");
+                return Ok(AgentResult {
+                    new_messages,
+                    text: text_buf,
+                    usage: total_usage,
+                    stop_reason: resolved_stop,
+                });
+            }
+
+            // Same cancel guard as run(): the provider stream may have
+            // taken seconds to drain; bail before tool dispatch if the
+            // caller cancelled meanwhile.
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled {
+                    partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
+                });
+            }
+
+            debug!(count = tool_uses.len(), "executing tool batch (stream)");
+            let calls: Vec<ToolCall> = tool_uses
+                .into_iter()
+                .map(|(id, name, input)| ToolCall { id, name, input })
+                .collect();
+            let results = self.executor.execute_batch(calls, &ctx).await;
+            let user_msg = Message::user(results);
+            history.push(user_msg.clone());
+            new_messages.push(user_msg);
+
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled {
+                    partial: build_partial(&new_messages, &total_usage, StopReason::Cancelled, ""),
+                });
+            }
+        }
+
+        warn!(turns = self.max_turns, "agent stream max turns");
+        Err(AgentError::MaxTurnsReached {
+            turns: self.max_turns,
+            partial: build_partial(
+                &new_messages,
+                &total_usage,
+                last_stop.unwrap_or(FALLBACK_STOP_REASON),
+                "",
+            ),
+        })
+    }
+}
+
+/// Live agent run.
+///
+/// `AgentStream` implements `Stream<Item = Result<StreamEvent,
+/// ProviderError>>` for the live event channel and exposes
+/// [`into_result`](Self::into_result) / [`collect_result`](Self::collect_result)
+/// for the terminal [`AgentResult`].
+pub struct AgentStream {
+    events_rx: ReceiverStream<Result<StreamEvent, ProviderError>>,
+    /// Optional so `into_result` can take it without dropping `self`.
+    result_rx: Option<oneshot::Receiver<Result<AgentResult, AgentError>>>,
+}
+
+impl Stream for AgentStream {
+    type Item = Result<StreamEvent, ProviderError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().events_rx).poll_next(cx)
+    }
+}
+
+impl AgentStream {
+    /// Wait for the loop to finish and return the final result.
+    ///
+    /// Drops the live event channel — call this only after you've
+    /// drained as many events as you care about (typically via the
+    /// `Stream` impl in a `while let Some(ev) = stream.next().await`
+    /// loop).
+    pub async fn into_result(mut self) -> Result<AgentResult, AgentError> {
+        let rx = self
+            .result_rx
+            .take()
+            .expect("into_result called twice on AgentStream");
+        // Drop the events receiver; if the producer is still running
+        // it'll see the channel close and short-circuit.
+        drop(self.events_rx);
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(AgentError::Cancelled {
+                partial: AgentResult {
+                    new_messages: Vec::new(),
+                    text: String::new(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Cancelled,
+                },
+            }),
+        }
+    }
+
+    /// Drain remaining events (discarding them) and return the result.
+    /// Convenient when the caller only cares about the final outcome —
+    /// equivalent to `while let Some(_) = stream.next().await {}` then
+    /// `into_result()`.
+    pub async fn collect_result(mut self) -> Result<AgentResult, AgentError> {
+        while self.events_rx.next().await.is_some() {}
+        let rx = self
+            .result_rx
+            .take()
+            .expect("collect_result called after into_result");
+        rx.await.unwrap_or_else(|_| {
+            Err(AgentError::Cancelled {
+                partial: AgentResult {
+                    new_messages: Vec::new(),
+                    text: String::new(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Cancelled,
+                },
+            })
         })
     }
 }

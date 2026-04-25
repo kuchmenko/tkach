@@ -1,10 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use futures::stream;
 
 use crate::error::ProviderError;
 use crate::message::{Content, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, Response};
+use crate::stream::{ProviderEventStream, StreamEvent};
 
 type ResponseFn = dyn Fn(&Request) -> Result<Response, ProviderError> + Send + Sync;
 
@@ -88,5 +90,107 @@ impl LlmProvider for Mock {
             *count += 1;
         }
         (self.handler)(&request)
+    }
+
+    async fn stream(&self, request: Request) -> Result<ProviderEventStream, ProviderError> {
+        // Mock streaming reuses the scripted Response: every Text block
+        // becomes one ContentDelta, every ToolUse becomes one atomic
+        // ToolUse event, then MessageDelta + Usage + Done. Tests can
+        // exercise the streaming code path without real SSE.
+        let response = {
+            let mut count = self.call_count.lock().unwrap();
+            *count += 1;
+            (self.handler)(&request)?
+        };
+
+        let events = response_to_events(response);
+        Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+    }
+}
+
+fn response_to_events(response: Response) -> Vec<StreamEvent> {
+    let mut events: Vec<StreamEvent> = Vec::new();
+    for content in response.content {
+        match content {
+            Content::Text { text } => events.push(StreamEvent::ContentDelta(text)),
+            Content::ToolUse { id, name, input } => {
+                events.push(StreamEvent::ToolUse { id, name, input })
+            }
+            Content::ToolResult { .. } => {
+                // ToolResult doesn't appear in assistant output; skip.
+            }
+        }
+    }
+    events.push(StreamEvent::MessageDelta {
+        stop_reason: response.stop_reason,
+    });
+    events.push(StreamEvent::Usage(response.usage));
+    events.push(StreamEvent::Done);
+    events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::Request;
+    use futures::StreamExt;
+    use serde_json::json;
+
+    fn empty_request() -> Request {
+        Request {
+            model: "test".into(),
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_stream_text_yields_one_delta_then_terminal_events() {
+        let mock = Mock::with_text("hello");
+        let mut s = mock.stream(empty_request()).await.unwrap();
+
+        let mut events = Vec::new();
+        while let Some(ev) = s.next().await {
+            events.push(ev.unwrap());
+        }
+
+        assert!(matches!(events[0], StreamEvent::ContentDelta(ref t) if t == "hello"));
+        assert!(matches!(
+            events[1],
+            StreamEvent::MessageDelta {
+                stop_reason: StopReason::EndTurn
+            }
+        ));
+        assert!(matches!(events[2], StreamEvent::Usage(_)));
+        assert!(matches!(events[3], StreamEvent::Done));
+    }
+
+    #[tokio::test]
+    async fn mock_stream_tool_use_emits_atomic_event() {
+        let mock = Mock::new(|_| {
+            Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "ls"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            })
+        });
+        let mut s = mock.stream(empty_request()).await.unwrap();
+
+        let first = s.next().await.unwrap().unwrap();
+        match first {
+            StreamEvent::ToolUse { id, name, input } => {
+                assert_eq!(id, "t1");
+                assert_eq!(name, "bash");
+                assert_eq!(input["command"], "ls");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
     }
 }

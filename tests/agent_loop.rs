@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use agent_runtime::message::{Content, Message, StopReason, Usage};
 use agent_runtime::provider::Response;
 use agent_runtime::providers::Mock;
-use agent_runtime::{Agent, AgentError, CancellationToken};
+use agent_runtime::{Agent, AgentError, CancellationToken, StreamEvent};
+use futures::StreamExt;
 use serde_json::json;
 
 fn test_dir() -> std::path::PathBuf {
@@ -615,4 +616,126 @@ async fn provider_error_returns_partial() {
     // One full tool round-trip happened before the provider failed.
     assert_eq!(partial.new_messages.len(), 2);
     assert_eq!(partial.usage.input_tokens, 10);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stream_text_response_emits_delta_then_collects_result() {
+    let agent = Agent::builder()
+        .provider(Mock::with_text("Hello, world!"))
+        .model("test")
+        .working_dir(test_dir())
+        .build();
+
+    let mut stream = agent.stream(prompt("hi"), CancellationToken::new());
+    let mut events: Vec<StreamEvent> = Vec::new();
+    while let Some(ev) = stream.next().await {
+        events.push(ev.unwrap());
+    }
+    let result = stream.into_result().await.unwrap();
+
+    // Mock emits one ContentDelta per Text block; ToolUse/MessageDelta/
+    // Usage/Done are absorbed by the agent loop and not forwarded.
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], StreamEvent::ContentDelta(t) if t == "Hello, world!"));
+
+    // Final history matches the run() shape: one assistant message with
+    // text body assembled from deltas.
+    assert_eq!(result.new_messages.len(), 1);
+    assert_eq!(result.text, "Hello, world!");
+    assert_eq!(result.stop_reason, StopReason::EndTurn);
+}
+
+#[tokio::test]
+async fn stream_tool_call_then_text_response_executes_tool_inline() {
+    let call = Arc::new(AtomicUsize::new(0));
+    let call_clone = call.clone();
+
+    let mock = Mock::new(move |_req| {
+        let n = call_clone.fetch_add(1, Ordering::SeqCst);
+        match n {
+            0 => Ok(Response {
+                content: vec![Content::ToolUse {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "echo hi"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            }),
+            _ => Ok(Response {
+                content: vec![Content::text("done")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            }),
+        }
+    });
+
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .tools(agent_runtime::tools::defaults())
+        .working_dir(test_dir())
+        .build();
+
+    let mut stream = agent.stream(prompt("run echo"), CancellationToken::new());
+    let mut tool_use_seen = false;
+    let mut final_text = String::new();
+    while let Some(ev) = stream.next().await {
+        match ev.unwrap() {
+            StreamEvent::ToolUse { name, .. } => {
+                assert_eq!(name, "bash");
+                tool_use_seen = true;
+            }
+            StreamEvent::ContentDelta(t) => final_text.push_str(&t),
+            _ => {}
+        }
+    }
+    let result = stream.into_result().await.unwrap();
+
+    assert!(tool_use_seen, "consumer should see ToolUse event");
+    assert_eq!(final_text, "done");
+    // Delta history: assistant(tool_use), user(tool_result), assistant(text) = 3
+    assert_eq!(result.new_messages.len(), 3);
+    assert_eq!(result.text, "done");
+}
+
+#[tokio::test]
+async fn stream_collect_result_skips_event_drain() {
+    let agent = Agent::builder()
+        .provider(Mock::with_text("ignored content"))
+        .model("test")
+        .working_dir(test_dir())
+        .build();
+
+    // Don't iterate events; collect_result should still complete.
+    let stream = agent.stream(prompt("hi"), CancellationToken::new());
+    let result = stream.collect_result().await.unwrap();
+
+    assert_eq!(result.text, "ignored content");
+    assert_eq!(result.new_messages.len(), 1);
+}
+
+#[tokio::test]
+async fn stream_cancel_before_start_returns_cancelled_via_into_result() {
+    let mock = Mock::with_text("never");
+    let agent = Agent::builder()
+        .provider(mock)
+        .model("test")
+        .working_dir(test_dir())
+        .build();
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let stream = agent.stream(prompt("hi"), cancel);
+
+    let err = stream.collect_result().await.unwrap_err();
+    let AgentError::Cancelled { partial } = &err else {
+        panic!("expected Cancelled, got {err:?}");
+    };
+    assert_eq!(partial.stop_reason, StopReason::Cancelled);
+    assert!(partial.new_messages.is_empty());
 }
