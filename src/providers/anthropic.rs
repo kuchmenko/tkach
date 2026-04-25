@@ -33,6 +33,16 @@ impl Anthropic {
 
 #[async_trait]
 impl LlmProvider for Anthropic {
+    async fn stream(
+        &self,
+        _request: Request,
+    ) -> Result<crate::stream::ProviderEventStream, ProviderError> {
+        // Real SSE implementation lands in stage 1.
+        Err(ProviderError::Other(
+            "Anthropic streaming not yet implemented".into(),
+        ))
+    }
+
     async fn complete(&self, request: Request) -> Result<Response, ProviderError> {
         let body = build_request_body(&request);
 

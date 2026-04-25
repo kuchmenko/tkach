@@ -62,6 +62,16 @@ impl OpenAICompatible {
 
 #[async_trait]
 impl LlmProvider for OpenAICompatible {
+    async fn stream(
+        &self,
+        _request: Request,
+    ) -> Result<crate::stream::ProviderEventStream, ProviderError> {
+        // Real SSE implementation lands in stage 2.
+        Err(ProviderError::Other(
+            "OpenAI-compatible streaming not yet implemented".into(),
+        ))
+    }
+
     async fn complete(&self, request: Request) -> Result<Response, ProviderError> {
         let body = build_request_body(&request);
         let url = format!("{}/chat/completions", self.base_url);

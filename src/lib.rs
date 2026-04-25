@@ -35,6 +35,7 @@ pub mod executor;
 pub mod message;
 pub mod provider;
 pub mod providers;
+pub mod stream;
 pub mod tool;
 pub mod tools;
 
@@ -44,5 +45,6 @@ pub use error::{AgentError, ProviderError, ToolError};
 pub use executor::{AllowAll, ToolCall, ToolExecutor, ToolPolicy, ToolRegistry};
 pub use message::{Content, Message, Role, StopReason, Usage};
 pub use provider::{LlmProvider, Request, Response, ToolDefinition};
+pub use stream::{ProviderEventStream, StreamEvent};
 pub use tokio_util::sync::CancellationToken;
 pub use tool::{Tool, ToolClass, ToolContext, ToolOutput};
