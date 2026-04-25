@@ -40,7 +40,7 @@ pub mod tool;
 pub mod tools;
 
 // Re-export core types at the crate root for convenience.
-pub use agent::{Agent, AgentBuilder, AgentResult};
+pub use agent::{Agent, AgentBuilder, AgentResult, AgentStream};
 pub use error::{AgentError, ProviderError, ToolError};
 pub use executor::{AllowAll, ToolCall, ToolExecutor, ToolPolicy, ToolRegistry};
 pub use message::{Content, Message, Role, StopReason, Usage};
