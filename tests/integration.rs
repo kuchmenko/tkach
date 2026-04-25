@@ -566,6 +566,7 @@ async fn smoke_anthropic_stream_roundtrip() {
                 }
             }
             StreamEvent::Done => got_done = true,
+            StreamEvent::ToolCallPending { .. } => {}
         }
     }
 
