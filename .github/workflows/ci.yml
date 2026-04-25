@@ -36,13 +36,20 @@ jobs:
         with:
           tool: clippy-sarif,sarif-fmt
       - name: Run clippy with SARIF output
-        # GitHub Actions runs multi-line `run:` via `bash -e` without
-        # pipefail. Without this, a non-zero `cargo clippy` exit is
-        # masked by the trailing `sarif-fmt` exiting 0, so lint failures
-        # silently pass CI. Force pipefail to propagate clippy errors.
+        # `set -eo pipefail` is required because GitHub Actions runs
+        # multi-line `run:` via `bash -e` without pipefail — a non-zero
+        # `cargo clippy` exit would otherwise be masked by `sarif-fmt`
+        # exiting 0.
+        #
+        # `--force-warn` keeps cognitive_complexity and too_many_lines
+        # at warn level even under the global `RUSTFLAGS: -Dwarnings`
+        # cap. Result: violations surface in SARIF / Code Scanning but
+        # don't fail CI; other lints stay strict.
         run: |
           set -eo pipefail
-          cargo clippy --all-targets --message-format=json \
+          cargo clippy --all-targets --message-format=json -- \
+            --force-warn=clippy::cognitive_complexity \
+            --force-warn=clippy::too_many_lines \
             | clippy-sarif \
             | tee clippy.sarif \
             | sarif-fmt
