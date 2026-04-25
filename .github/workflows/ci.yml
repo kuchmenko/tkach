@@ -55,11 +55,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
       # `--all-targets` also builds examples — catches regressions in
       # examples/basic.rs, custom_tool.rs, parallel_tools.rs that plain
       # `cargo test` would silently miss.
-      - run: cargo test --all-targets
+      - name: Run tests with coverage
+        run: cargo llvm-cov --all-targets --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
 
   audit:
     name: Security Audit
