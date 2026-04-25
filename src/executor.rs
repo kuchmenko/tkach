@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use futures::future::join_all;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::message::Content;
 use crate::tool::{Tool, ToolClass, ToolContext};
@@ -37,12 +38,23 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Build a registry from a tool list. If two tools share a `name()`,
+    /// the later registration wins (consistent with `HashMap::insert`)
+    /// and a `tracing::warn!` records the collision so silent shadowing
+    /// — e.g. a custom tool accidentally masking a built-in — is at
+    /// least visible in logs.
     pub fn new(tools: Vec<Arc<dyn Tool>>) -> Self {
-        let tools = tools
-            .into_iter()
-            .map(|t| (t.name().to_string(), t))
-            .collect();
-        Self { tools }
+        let mut map: HashMap<String, Arc<dyn Tool>> = HashMap::with_capacity(tools.len());
+        for t in tools {
+            let name = t.name().to_string();
+            if map.insert(name.clone(), t).is_some() {
+                warn!(
+                    tool = %name,
+                    "duplicate tool name in registry; later registration overrode earlier"
+                );
+            }
+        }
+        Self { tools: map }
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {

@@ -10,6 +10,13 @@ use crate::message::{Content, Message, StopReason, Usage};
 use crate::provider::{LlmProvider, Request, ToolDefinition};
 use crate::tool::{Tool, ToolContext};
 
+/// Fallback `stop_reason` for partial results returned before any turn
+/// has completed (e.g. provider failure on turn 0). Documented as
+/// "no successful turn yet" — callers can disambiguate using the
+/// outer `AgentError` variant. `EndTurn` is the least-misleading
+/// concrete StopReason for the empty-history case.
+const FALLBACK_STOP_REASON: StopReason = StopReason::EndTurn;
+
 /// Result of an agent run.
 ///
 /// The agent is stateless: it does **not** retain conversation history
@@ -122,7 +129,10 @@ impl Agent {
         let mut history = messages;
         let mut new_messages: Vec<Message> = Vec::new();
         let mut total_usage = Usage::default();
-        let mut last_stop = StopReason::EndTurn;
+        // None until the first provider response lands. Using Option here
+        // (rather than seeding with `EndTurn`) avoids a misleading
+        // `partial.stop_reason: EndTurn` on first-turn provider failures.
+        let mut last_stop: Option<StopReason> = None;
 
         let tool_defs = self.tool_definitions();
         let ctx = self.make_context(cancel.clone());
@@ -150,14 +160,19 @@ impl Agent {
                 Err(source) => {
                     return Err(AgentError::Provider {
                         source,
-                        partial: build_partial(&new_messages, &total_usage, last_stop, ""),
+                        partial: build_partial(
+                            &new_messages,
+                            &total_usage,
+                            last_stop.unwrap_or(FALLBACK_STOP_REASON),
+                            "",
+                        ),
                     });
                 }
             };
 
             total_usage.input_tokens += response.usage.input_tokens;
             total_usage.output_tokens += response.usage.output_tokens;
-            last_stop = response.stop_reason;
+            last_stop = Some(response.stop_reason);
 
             let assistant_msg = Message::assistant(response.content.clone());
             history.push(assistant_msg.clone());
@@ -179,11 +194,13 @@ impl Agent {
             if tool_calls.is_empty() || response.stop_reason == StopReason::EndTurn {
                 let text = extract_text(&response.content);
                 info!(turn, "agent finished");
+                // Safe to unwrap: we just assigned `Some` above when this
+                // response was decoded.
                 return Ok(AgentResult {
                     new_messages,
                     text,
                     usage: total_usage,
-                    stop_reason: last_stop,
+                    stop_reason: last_stop.unwrap_or(FALLBACK_STOP_REASON),
                 });
             }
 
@@ -217,7 +234,12 @@ impl Agent {
 
         Err(AgentError::MaxTurnsReached {
             turns: self.max_turns,
-            partial: build_partial(&new_messages, &total_usage, last_stop, ""),
+            partial: build_partial(
+                &new_messages,
+                &total_usage,
+                last_stop.unwrap_or(FALLBACK_STOP_REASON),
+                "",
+            ),
         })
     }
 }
