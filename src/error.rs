@@ -110,9 +110,15 @@ pub enum ProviderError {
 
 impl ProviderError {
     /// Is it safe to retry the same request after a backoff?
+    ///
+    /// `Http` errors are split: timeouts, connect failures, body-read
+    /// glitches, and generic request failures are transient and
+    /// retryable; decode failures (malformed bytes — same input means
+    /// same parse failure), builder errors (caller bug — bad URL,
+    /// invalid header), and redirect cycles are persistent and not.
     pub fn is_retryable(&self) -> bool {
         match self {
-            ProviderError::Http(_) => true,
+            ProviderError::Http(e) => is_transient_reqwest(e),
             ProviderError::Api { retryable, .. } => *retryable,
             ProviderError::Overloaded { .. } | ProviderError::RateLimit { .. } => true,
             ProviderError::Deserialization(_) | ProviderError::Other(_) => false,
@@ -130,6 +136,21 @@ impl ProviderError {
             _ => None,
         }
     }
+}
+
+/// Classify a `reqwest::Error` as transient (retryable) or permanent.
+///
+/// reqwest groups failures into orthogonal categories via `is_*` predicates.
+/// We retry on transport-level glitches the server might recover from
+/// (network blips, timeouts) and refuse to retry on caller-side bugs
+/// (malformed URL, broken response decoding) — the same input would
+/// produce the same failure on the next attempt.
+fn is_transient_reqwest(e: &reqwest::Error) -> bool {
+    if e.is_decode() || e.is_builder() || e.is_redirect() {
+        return false;
+    }
+    // Timeout / connect / body-read / generic request → transient.
+    e.is_timeout() || e.is_connect() || e.is_body() || e.is_request()
 }
 
 #[derive(Debug, Error)]

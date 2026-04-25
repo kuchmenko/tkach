@@ -83,7 +83,12 @@ impl LlmProvider for OpenAICompatible {
             return Err(classify_error(status, text, retry_after_ms));
         }
 
-        let api_response: ApiResponse = response.json().await?;
+        // Read body as text first, then parse explicitly. `response.json()`
+        // would map serde failures to `reqwest::Error` → `ProviderError::Http`
+        // which `is_retryable()` treats as retryable — wrong for malformed
+        // 2xx payloads. Persistent garbage should fail fast, not loop.
+        let body = response.text().await?;
+        let api_response: ApiResponse = serde_json::from_str(&body)?;
         convert_response(api_response)
     }
 }
@@ -278,7 +283,7 @@ fn extend_with_message(out: &mut Vec<ApiMessage>, msg: &Message) {
                     Content::ToolResult {
                         tool_use_id,
                         content,
-                        ..
+                        is_error,
                     } => {
                         // Flush any pending user text before the tool results.
                         if !text_buf.is_empty() {
@@ -287,10 +292,21 @@ fn extend_with_message(out: &mut Vec<ApiMessage>, msg: &Message) {
                                 content: std::mem::take(&mut text_buf),
                             });
                         }
+                        // OpenAI's `role: "tool"` schema has no is_error field;
+                        // tools that returned errors would otherwise look
+                        // identical to successful results to the next turn.
+                        // Prefix the content with [error] so the model can
+                        // disambiguate. Anthropic-via-OpenRouter strips this
+                        // back out on its side; native OpenAI sees it inline.
+                        let wire_content = if *is_error {
+                            format!("[error] {content}")
+                        } else {
+                            content.clone()
+                        };
                         out.push(ApiMessage::Tool {
                             role: "tool",
                             tool_call_id: tool_use_id.clone(),
-                            content: content.clone(),
+                            content: wire_content,
                         });
                     }
                     Content::ToolUse { .. } => {
@@ -327,6 +343,15 @@ fn extend_with_message(out: &mut Vec<ApiMessage>, msg: &Message) {
                         // Not expected on assistant side; skip.
                     }
                 }
+            }
+            // An empty assistant message ({"role":"assistant"}) is rejected
+            // by many compat backends ("messages must have content"). This
+            // can happen if the model produced a turn with no text and no
+            // tool_calls — replay through the agent's stateless flow would
+            // otherwise corrupt history. Skip it; the next user message
+            // follows directly.
+            if text_parts.is_empty() && tool_calls.is_empty() {
+                return;
             }
             out.push(ApiMessage::Assistant {
                 role: "assistant",
@@ -371,6 +396,8 @@ fn convert_response(api: ApiResponse) -> Result<Response, ProviderError> {
         });
     }
 
+    let has_tool_use = content.iter().any(|c| matches!(c, Content::ToolUse { .. }));
+
     let stop_reason = match choice.finish_reason.as_deref() {
         Some("stop") => StopReason::EndTurn,
         Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
@@ -379,6 +406,11 @@ fn convert_response(api: ApiResponse) -> Result<Response, ProviderError> {
         // `stop_sequence`-style markers aren't standard in OpenAI; map to
         // our StopSequence when we see it (some providers use this).
         Some("stop_sequence") => StopReason::StopSequence,
+        // Missing or unknown finish_reason: if the response has tool_calls
+        // we know the model wants to use them — defaulting to EndTurn
+        // would make the agent loop terminate without invoking the tool.
+        // Some compat backends omit finish_reason on tool-use turns.
+        _ if has_tool_use => StopReason::ToolUse,
         _ => StopReason::EndTurn,
     };
 
@@ -561,5 +593,77 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn response_infers_tool_use_when_finish_reason_missing() {
+        // Some compat backends omit `finish_reason` on tool-use turns.
+        // The response carries `tool_calls` so we should still recognise
+        // it as a ToolUse stop, not default to EndTurn.
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"}
+                    }]
+                }
+                // finish_reason intentionally absent
+            }]
+        });
+        let api: ApiResponse = serde_json::from_value(raw).unwrap();
+        let resp = convert_response(api).unwrap();
+        assert_eq!(resp.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn request_marks_error_tool_results_with_prefix() {
+        // The OpenAI tool-message schema has no is_error field; we must
+        // encode the error state in the content so the next assistant
+        // turn can disambiguate success from failure.
+        let req = Request {
+            model: "m".into(),
+            system: None,
+            messages: vec![Message::user(vec![
+                Content::tool_result("call_ok", "all good", false),
+                Content::tool_result("call_bad", "something broke", true),
+            ])],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let msgs = json["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["content"], "all good");
+        assert_eq!(msgs[1]["content"], "[error] something broke");
+    }
+
+    #[test]
+    fn request_skips_empty_assistant_messages() {
+        // An assistant turn with neither text nor tool_calls would emit
+        // {"role":"assistant"} — many compat endpoints reject this on the
+        // next call. The encoder should drop it instead.
+        let req = Request {
+            model: "m".into(),
+            system: None,
+            messages: vec![
+                Message::user_text("hi"),
+                Message::assistant(vec![]), // empty turn
+                Message::user_text("still there?"),
+            ],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let msgs = json["messages"].as_array().unwrap();
+        // Expect: user "hi", user "still there?" — empty assistant skipped.
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["role"], "user");
     }
 }
