@@ -2,10 +2,6 @@
 //!
 //! A provider-independent agent runtime for Rust with built-in tools.
 //!
-//! `tkach` is Russian for "weaver" — the runtime weaves provider calls,
-//! tool dispatch, approval gating and cancellation into a single agent
-//! loop.
-//!
 //! The agent is stateless — callers own the message history and pass
 //! it in on every call.
 //!

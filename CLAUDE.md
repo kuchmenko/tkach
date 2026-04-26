@@ -1,10 +1,7 @@
 # tkach
 
 Provider-independent single-agent runtime for Rust with built-in tools.
-
-`tkach` (ткач) is Russian for *weaver* — the runtime weaves provider
-calls, tool dispatch, approval gating and cancellation into a single
-agent loop. Crate name and library import path are both `tkach`.
+Crate name and library import path are both `tkach`.
 
 The repository is `kuchmenko/tkach` on GitHub. It was previously named
 `kuchmenko/agent-runtime` (until 2026-04-26) and `kuchmenko/fellowship-rs`
