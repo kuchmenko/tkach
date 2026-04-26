@@ -2,8 +2,6 @@
 
 A provider-independent agent runtime for Rust. Stateless agent loop, pluggable LLM providers, built-in file/shell tools, real SSE streaming, cooperative cancellation, and per-call approval gating.
 
-> `tkach` (ткач) is Russian for *weaver*. The runtime weaves provider calls, tool dispatch, approval gating, and cancellation into a single agent loop.
-
 [![Crates.io](https://img.shields.io/crates/v/tkach.svg)](https://crates.io/crates/tkach)
 [![Docs.rs](https://img.shields.io/docsrs/tkach)](https://docs.rs/tkach)
 [![CI](https://github.com/kuchmenko/tkach/actions/workflows/ci.yml/badge.svg)](https://github.com/kuchmenko/tkach/actions/workflows/ci.yml)
