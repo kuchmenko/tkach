@@ -112,7 +112,7 @@ fn response_to_events(response: Response) -> Vec<StreamEvent> {
     let mut events: Vec<StreamEvent> = Vec::new();
     for content in response.content {
         match content {
-            Content::Text { text } => events.push(StreamEvent::ContentDelta(text)),
+            Content::Text { text, .. } => events.push(StreamEvent::ContentDelta(text)),
             Content::ToolUse { id, name, input } => {
                 events.push(StreamEvent::ToolUse { id, name, input })
             }

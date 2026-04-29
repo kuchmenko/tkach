@@ -2,21 +2,70 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::ProviderError;
-use crate::message::{Content, Message, StopReason, Usage};
+use crate::message::{CacheControl, Content, Message, StopReason, Usage};
 use crate::stream::ProviderEventStream;
 
 /// Definition of a tool that gets sent to the LLM.
+///
+/// `cache_control` terminates a cached prefix segment at this tool
+/// definition. The Anthropic API caches tool definitions in the order
+/// they appear in the request — placing a breakpoint on the **last**
+/// tool caches the entire toolset. Non-Anthropic providers ignore
+/// this field.
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    pub cache_control: Option<CacheControl>,
+}
+
+/// One block of the system prompt.
+///
+/// `Request.system` is a list because Anthropic's API accepts multiple
+/// system blocks, each individually markable with [`CacheControl`] —
+/// useful when part of the system prompt is stable (e.g. base
+/// instructions) and part rotates per-call (e.g. user-specific context).
+///
+/// Non-Anthropic providers concatenate all blocks with `\n\n` into a
+/// single system string and drop `cache_control`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SystemBlock {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl SystemBlock {
+    /// Plain system block, no cache breakpoint.
+    pub fn text(s: impl Into<String>) -> Self {
+        Self {
+            text: s.into(),
+            cache_control: None,
+        }
+    }
+
+    /// System block marked as a cache breakpoint with the default 5m TTL.
+    pub fn cached(s: impl Into<String>) -> Self {
+        Self {
+            text: s.into(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }
+    }
+
+    /// System block marked as a cache breakpoint with 1-hour TTL.
+    pub fn cached_1h(s: impl Into<String>) -> Self {
+        Self {
+            text: s.into(),
+            cache_control: Some(CacheControl::ephemeral_1h()),
+        }
+    }
 }
 
 /// Request to the LLM provider.
 pub struct Request {
     pub model: String,
-    pub system: Option<String>,
+    pub system: Option<Vec<SystemBlock>>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: u32,

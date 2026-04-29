@@ -14,8 +14,8 @@ use tracing::{debug, info, warn};
 use crate::approval::{ApprovalHandler, AutoApprove};
 use crate::error::{AgentError, ProviderError};
 use crate::executor::{AllowAll, ToolCall, ToolExecutor, ToolPolicy, ToolRegistry};
-use crate::message::{Content, Message, StopReason, Usage};
-use crate::provider::{LlmProvider, Request, ToolDefinition};
+use crate::message::{CacheControl, Content, Message, StopReason, Usage};
+use crate::provider::{LlmProvider, Request, SystemBlock, ToolDefinition};
 use crate::stream::StreamEvent;
 use crate::tool::{Tool, ToolContext};
 
@@ -68,7 +68,7 @@ pub struct AgentResult {
 pub struct Agent {
     provider: Arc<dyn LlmProvider>,
     model: String,
-    system: Option<String>,
+    system: Option<Vec<SystemBlock>>,
     executor: Arc<ToolExecutor>,
     max_turns: usize,
     max_tokens: u32,
@@ -76,6 +76,11 @@ pub struct Agent {
     working_dir: PathBuf,
     max_depth: usize,
     depth: usize,
+    /// When `Some`, the last `ToolDefinition` sent to the provider has
+    /// its `cache_control` set, terminating a cached prefix segment
+    /// over the entire toolset. Anthropic-only optimization;
+    /// non-Anthropic providers ignore the field.
+    cache_tools: Option<CacheControl>,
 }
 
 impl Agent {
@@ -92,6 +97,10 @@ impl Agent {
 
     /// Tool definitions sent to the LLM, sorted by name for deterministic
     /// ordering (so prompt-cache hashes stay stable across turns).
+    ///
+    /// When `cache_tools` is set, `cache_control` is placed on the last
+    /// (alphabetically-final) tool definition, caching the entire
+    /// toolset as one segment.
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut defs: Vec<ToolDefinition> = self
             .executor
@@ -101,9 +110,15 @@ impl Agent {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 input_schema: t.input_schema(),
+                cache_control: None,
             })
             .collect();
         defs.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Some(cc) = &self.cache_tools {
+            if let Some(last) = defs.last_mut() {
+                last.cache_control = Some(cc.clone());
+            }
+        }
         defs
     }
 
@@ -183,8 +198,7 @@ impl Agent {
                 }
             };
 
-            total_usage.input_tokens += response.usage.input_tokens;
-            total_usage.output_tokens += response.usage.output_tokens;
+            total_usage.add(&response.usage);
             last_stop = Some(response.stop_reason);
 
             let assistant_msg = Message::assistant(response.content.clone());
@@ -440,10 +454,11 @@ impl Agent {
                     }
                     StreamEvent::Usage(u) => {
                         // Anthropic emits two Usage events (start with
-                        // input_tokens, end with output_tokens). Take
-                        // max so we keep both pieces.
-                        turn_usage.input_tokens = turn_usage.input_tokens.max(u.input_tokens);
-                        turn_usage.output_tokens = turn_usage.output_tokens.max(u.output_tokens);
+                        // input_tokens + cache fields, end with
+                        // output_tokens). The provider re-stamps cache
+                        // fields onto every emission so merge_max here
+                        // keeps the correct values across both events.
+                        turn_usage.merge_max(&u);
                     }
                     StreamEvent::Done => break,
                     // ToolCallPending is an agent-emitted event and
@@ -456,8 +471,7 @@ impl Agent {
             // connection before the next turn opens a new one.
             drop(provider_stream);
 
-            total_usage.input_tokens += turn_usage.input_tokens;
-            total_usage.output_tokens += turn_usage.output_tokens;
+            total_usage.add(&turn_usage);
             let resolved_stop = turn_stop.unwrap_or(StopReason::EndTurn);
             last_stop = Some(resolved_stop);
 
@@ -466,9 +480,7 @@ impl Agent {
             // Anthropic's complete() returns content.
             let mut assistant_content: Vec<Content> = Vec::new();
             if !text_buf.is_empty() {
-                assistant_content.push(Content::Text {
-                    text: text_buf.clone(),
-                });
+                assistant_content.push(Content::text(text_buf.clone()));
             }
             for (id, name, input) in &tool_uses {
                 assistant_content.push(Content::ToolUse {
@@ -652,7 +664,7 @@ fn extract_text(content: &[Content]) -> String {
     content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text } => Some(text.as_str()),
+            Content::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -664,7 +676,7 @@ fn extract_text(content: &[Content]) -> String {
 pub struct AgentBuilder {
     provider: Option<Arc<dyn LlmProvider>>,
     model: Option<String>,
-    system: Option<String>,
+    system: Option<Vec<SystemBlock>>,
     tools: Vec<Arc<dyn Tool>>,
     policy: Option<Arc<dyn ToolPolicy>>,
     approval: Option<Arc<dyn ApprovalHandler>>,
@@ -675,6 +687,7 @@ pub struct AgentBuilder {
     working_dir: Option<PathBuf>,
     max_depth: usize,
     depth: usize,
+    cache_tools: Option<CacheControl>,
 }
 
 impl AgentBuilder {
@@ -693,6 +706,7 @@ impl AgentBuilder {
             working_dir: None,
             max_depth: 3,
             depth: 0,
+            cache_tools: None,
         }
     }
 
@@ -712,8 +726,38 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the system prompt as a single uncached block.
+    ///
+    /// Use [`Self::system_blocks`] for a typed multi-block system
+    /// prompt with [`crate::CacheControl`] breakpoints (Anthropic
+    /// prompt caching).
     pub fn system(mut self, system: impl Into<String>) -> Self {
-        self.system = Some(system.into());
+        self.system = Some(vec![SystemBlock::text(system)]);
+        self
+    }
+
+    /// Set the system prompt as a list of typed blocks. Each block
+    /// can carry a [`crate::CacheControl`] cache breakpoint —
+    /// useful when part of the prompt is stable across calls (good
+    /// to cache) and part rotates per-call.
+    ///
+    /// Non-Anthropic providers concatenate the blocks with `\n\n`
+    /// and drop cache_control.
+    pub fn system_blocks(mut self, blocks: Vec<SystemBlock>) -> Self {
+        self.system = Some(blocks);
+        self
+    }
+
+    /// Cache the entire toolset as a single prefix segment with the
+    /// given TTL. The agent places `cache_control` on the last
+    /// (alphabetically-final) tool definition each turn, which makes
+    /// Anthropic cache every preceding tool too.
+    ///
+    /// For long stable toolsets (the default 8 built-in tools clear
+    /// several KB of JSON Schema), this is the highest-leverage
+    /// breakpoint in tkach. Non-Anthropic providers ignore it.
+    pub fn cache_tools(mut self, cache_control: CacheControl) -> Self {
+        self.cache_tools = Some(cache_control);
         self
     }
 
@@ -815,6 +859,7 @@ impl AgentBuilder {
                 .unwrap_or_else(|| std::env::current_dir().expect("failed to get current dir")),
             max_depth: self.max_depth,
             depth: self.depth,
+            cache_tools: self.cache_tools,
         }
     }
 }

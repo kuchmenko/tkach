@@ -116,6 +116,10 @@ let p = OpenAICompatible::new("ignored")
 
 Implementing your own provider: implement `LlmProvider` (one `complete` and one `stream` method).
 
+### Anthropic prompt caching
+
+`SystemBlock::cached`, `Content::text_cached`, and `AgentBuilder::cache_tools` mark cache breakpoints; `Usage` reports `cache_creation_input_tokens` / `cache_read_input_tokens` so callers can measure hit rate. Default TTL 5min, 1h via `CacheControl::ephemeral_1h()`. Cache reads bill at 0.1x base input; writes at 1.25x (5m) / 2x (1h). See `examples/anthropic_caching.rs` and `examples/anthropic_caching_streaming.rs`.
+
 ## Streaming
 
 ```rust

@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ProviderError;
-use crate::message::{Content, StopReason, Usage};
-use crate::provider::{LlmProvider, Request, Response};
+use crate::message::{CacheControl, Content, StopReason, Usage};
+use crate::provider::{LlmProvider, Request, Response, SystemBlock};
 use crate::stream::{ProviderEventStream, StreamEvent};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -129,18 +129,28 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 //
 // Anthropic emits events in this lifecycle:
 //
-//   message_start            (carries initial input_tokens in usage)
+//   message_start            (carries initial input_tokens + cache fields
+//                             in usage)
 //   content_block_start[i]   (text or tool_use; tool_use has id, name)
 //   content_block_delta[i] * (text_delta or input_json_delta fragments)
 //   content_block_stop[i]    (close block; for tool_use we now emit
 //                             one atomic StreamEvent::ToolUse with
 //                             accumulated JSON parsed)
 //   ... more blocks ...
-//   message_delta            (final stop_reason + final output_tokens)
+//   message_delta            (final stop_reason + final output_tokens;
+//                             cache fields are NOT re-sent here)
 //   message_stop             (terminal)
 //
 // `ping` and unknown event types are ignored. `error` events surface
 // as `Err(ProviderError::Other)` items in the stream and terminate it.
+//
+// Cache token merge: per Anthropic docs, cache_creation_input_tokens
+// and cache_read_input_tokens arrive on `message_start` only. We
+// remember them on the stream state and re-stamp every emitted Usage
+// event with the running maximum, so a consumer that tracks "the
+// latest Usage" never observes the cache fields collapse to 0 on
+// message_delta. `merge_max` semantics are also exposed publicly via
+// `Usage::merge_max`.
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -228,6 +238,18 @@ enum BlockState {
     },
 }
 
+/// Streaming state carried across `unfold` polls. Holds the running
+/// `Usage` so cache_creation/cache_read tokens observed on
+/// `message_start` survive into `message_delta` and any subsequent
+/// `Usage` emission.
+struct StreamState<S> {
+    sse: S,
+    blocks: HashMap<usize, BlockState>,
+    buffer: std::collections::VecDeque<Result<StreamEvent, ProviderError>>,
+    /// Running merged `Usage` — re-stamped onto each emitted Usage event.
+    usage: Usage,
+}
+
 fn anthropic_event_stream<S>(
     sse: S,
 ) -> impl futures::Stream<Item = Result<StreamEvent, ProviderError>>
@@ -243,26 +265,27 @@ where
 {
     use std::collections::VecDeque;
 
-    let initial: (
-        S,
-        HashMap<usize, BlockState>,
-        VecDeque<Result<StreamEvent, ProviderError>>,
-    ) = (sse, HashMap::new(), VecDeque::new());
+    let initial = StreamState {
+        sse,
+        blocks: HashMap::new(),
+        buffer: VecDeque::new(),
+        usage: Usage::default(),
+    };
 
-    futures::stream::unfold(initial, |(mut sse, mut blocks, mut buffer)| async move {
+    futures::stream::unfold(initial, |mut state| async move {
         // Drain any pending events first — one SSE event can produce
         // multiple StreamEvents (e.g. message_delta → MessageDelta + Usage).
         loop {
-            if let Some(ev) = buffer.pop_front() {
-                return Some((ev, (sse, blocks, buffer)));
+            if let Some(ev) = state.buffer.pop_front() {
+                return Some((ev, state));
             }
 
-            let next = sse.next().await?;
+            let next = state.sse.next().await?;
             let event = match next {
                 Ok(ev) => ev,
                 Err(e) => {
                     let err = ProviderError::Other(format!("SSE read error: {e}"));
-                    return Some((Err(err), (sse, blocks, buffer)));
+                    return Some((Err(err), state));
                 }
             };
 
@@ -274,7 +297,12 @@ where
                 Err(_) => continue, // unknown / malformed payload, skip
             };
 
-            process_payload(payload, &mut blocks, &mut buffer);
+            process_payload(
+                payload,
+                &mut state.blocks,
+                &mut state.buffer,
+                &mut state.usage,
+            );
         }
     })
 }
@@ -283,14 +311,13 @@ fn process_payload(
     payload: StreamingPayload,
     blocks: &mut HashMap<usize, BlockState>,
     buffer: &mut std::collections::VecDeque<Result<StreamEvent, ProviderError>>,
+    running: &mut Usage,
 ) {
     match payload {
         StreamingPayload::MessageStart { message } => {
             if let Some(usage) = message.usage {
-                buffer.push_back(Ok(StreamEvent::Usage(Usage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                })));
+                running.merge_max(&usage_from_api(&usage));
+                buffer.push_back(Ok(StreamEvent::Usage(running.clone())));
             }
         }
         StreamingPayload::ContentBlockStart {
@@ -341,10 +368,8 @@ fn process_payload(
                 buffer.push_back(Ok(StreamEvent::MessageDelta { stop_reason }));
             }
             if let Some(u) = usage {
-                buffer.push_back(Ok(StreamEvent::Usage(Usage {
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                })));
+                running.merge_max(&usage_from_api(&u));
+                buffer.push_back(Ok(StreamEvent::Usage(running.clone())));
             }
         }
         StreamingPayload::MessageStop => {
@@ -373,6 +398,15 @@ fn map_stop_reason(s: &str) -> StopReason {
     }
 }
 
+fn usage_from_api(api: &ApiUsage) -> Usage {
+    Usage {
+        input_tokens: api.input_tokens,
+        output_tokens: api.output_tokens,
+        cache_creation_input_tokens: api.cache_creation_input_tokens,
+        cache_read_input_tokens: api.cache_read_input_tokens,
+    }
+}
+
 // --- Anthropic API types ---
 
 #[derive(Serialize)]
@@ -380,8 +414,11 @@ struct ApiRequest {
     model: String,
     max_tokens: u32,
     messages: Vec<ApiMessage>,
+    /// Typed system blocks (Anthropic accepts either a free string or
+    /// an array of typed blocks; we always emit the array form so
+    /// `cache_control` works).
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<Vec<ApiSystemBlock>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ApiTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -402,7 +439,11 @@ struct ApiMessage {
 #[serde(tag = "type")]
 enum ApiContent {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
 
     #[serde(rename = "tool_use")]
     ToolUse {
@@ -417,7 +458,19 @@ enum ApiContent {
         content: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
+}
+
+#[derive(Serialize)]
+struct ApiSystemBlock {
+    /// Anthropic's typed system block has `type: "text"`.
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Serialize)]
@@ -425,6 +478,8 @@ struct ApiTool {
     name: String,
     description: String,
     input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Deserialize)]
@@ -438,6 +493,10 @@ struct ApiResponse {
 struct ApiUsage {
     input_tokens: u32,
     output_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
 }
 
 // --- Conversion ---
@@ -462,6 +521,7 @@ fn build_request_body(request: &Request) -> ApiRequest {
             name: t.name.clone(),
             description: t.description.clone(),
             input_schema: t.input_schema.clone(),
+            cache_control: t.cache_control.clone(),
         })
         .collect();
 
@@ -469,7 +529,16 @@ fn build_request_body(request: &Request) -> ApiRequest {
         model: request.model.clone(),
         max_tokens: request.max_tokens,
         messages,
-        system: request.system.clone(),
+        system: request.system.as_ref().map(|blocks| {
+            blocks
+                .iter()
+                .map(|b: &SystemBlock| ApiSystemBlock {
+                    kind: "text",
+                    text: b.text.clone(),
+                    cache_control: b.cache_control.clone(),
+                })
+                .collect()
+        }),
         tools,
         temperature: request.temperature,
         stream: false,
@@ -478,7 +547,13 @@ fn build_request_body(request: &Request) -> ApiRequest {
 
 fn content_to_api(content: &Content) -> ApiContent {
     match content {
-        Content::Text { text } => ApiContent::Text { text: text.clone() },
+        Content::Text {
+            text,
+            cache_control,
+        } => ApiContent::Text {
+            text: text.clone(),
+            cache_control: cache_control.clone(),
+        },
         Content::ToolUse { id, name, input } => ApiContent::ToolUse {
             id: id.clone(),
             name: name.clone(),
@@ -488,10 +563,12 @@ fn content_to_api(content: &Content) -> ApiContent {
             tool_use_id,
             content,
             is_error,
+            cache_control,
         } => ApiContent::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),
             is_error: *is_error,
+            cache_control: cache_control.clone(),
         },
     }
 }
@@ -501,16 +578,24 @@ fn convert_response(api: ApiResponse) -> Response {
         .content
         .into_iter()
         .map(|c| match c {
-            ApiContent::Text { text } => Content::Text { text },
+            ApiContent::Text {
+                text,
+                cache_control,
+            } => Content::Text {
+                text,
+                cache_control,
+            },
             ApiContent::ToolUse { id, name, input } => Content::ToolUse { id, name, input },
             ApiContent::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
+                cache_control,
             } => Content::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
+                cache_control,
             },
         })
         .collect();
@@ -520,9 +605,235 @@ fn convert_response(api: ApiResponse) -> Response {
     Response {
         content,
         stop_reason,
-        usage: Usage {
-            input_tokens: api.usage.input_tokens,
-            output_tokens: api.usage.output_tokens,
-        },
+        usage: usage_from_api(&api.usage),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::{CacheTtl, Message};
+    use crate::provider::ToolDefinition;
+    use serde_json::json;
+
+    fn req_with_system(blocks: Vec<SystemBlock>) -> Request {
+        Request {
+            model: "claude-test".into(),
+            system: Some(blocks),
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: None,
+        }
+    }
+
+    fn system_blocks_json(blocks: Vec<SystemBlock>) -> serde_json::Value {
+        let req = req_with_system(blocks);
+        let body = build_request_body(&req);
+        serde_json::to_value(&body).unwrap()
+    }
+
+    #[test]
+    fn system_blocks_serialize_as_typed_array() {
+        let json = system_blocks_json(vec![
+            SystemBlock::text("base instructions"),
+            SystemBlock::cached("long stable context"),
+        ]);
+        let arr = json["system"].as_array().expect("system should be array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[1]["type"], "text");
+    }
+
+    #[test]
+    fn system_blocks_serialize_text_payloads() {
+        let json = system_blocks_json(vec![
+            SystemBlock::text("base instructions"),
+            SystemBlock::cached("long stable context"),
+        ]);
+        assert_eq!(json["system"][0]["text"], "base instructions");
+        assert_eq!(json["system"][1]["text"], "long stable context");
+    }
+
+    #[test]
+    fn system_blocks_serialize_cache_control_only_when_set() {
+        let json = system_blocks_json(vec![
+            SystemBlock::text("base instructions"),
+            SystemBlock::cached("long stable context"),
+        ]);
+        assert!(json["system"][0].get("cache_control").is_none());
+        assert_eq!(json["system"][1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn system_blocks_with_one_hour_ttl_serialize_inline() {
+        let req = req_with_system(vec![SystemBlock::cached_1h("long-lived prefix")]);
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let cc = &json["system"][0]["cache_control"];
+        assert_eq!(cc["type"], "ephemeral");
+        assert_eq!(cc["ttl"], "1h");
+    }
+
+    #[test]
+    fn tool_definition_cache_control_threads_to_api_tool() {
+        let req = Request {
+            model: "m".into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: vec![
+                ToolDefinition {
+                    name: "first".into(),
+                    description: "first tool".into(),
+                    input_schema: json!({"type":"object"}),
+                    cache_control: None,
+                },
+                ToolDefinition {
+                    name: "last".into(),
+                    description: "last tool".into(),
+                    input_schema: json!({"type":"object"}),
+                    cache_control: Some(CacheControl::ephemeral()),
+                },
+            ],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let tools = json["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn content_text_cache_control_threads_through() {
+        let req = Request {
+            model: "m".into(),
+            system: None,
+            messages: vec![Message::user(vec![Content::Text {
+                text: "stable user prefix".into(),
+                cache_control: Some(CacheControl::Ephemeral {
+                    ttl: Some(CacheTtl::FiveMinutes),
+                }),
+            }])],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let block = &json["messages"][0]["content"][0];
+        assert_eq!(block["type"], "text");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+        assert_eq!(block["cache_control"]["ttl"], "5m");
+    }
+
+    #[test]
+    fn tool_result_cache_control_threads_through() {
+        let req = Request {
+            model: "m".into(),
+            system: None,
+            messages: vec![Message::user(vec![Content::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "long output".into(),
+                is_error: false,
+                cache_control: Some(CacheControl::ephemeral()),
+            }])],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let block = &json["messages"][0]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn response_with_cache_usage_parses_all_four_fields() {
+        let raw = json!({
+            "content": [{"type":"text","text":"ok"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 200
+            }
+        });
+        let api: ApiResponse = serde_json::from_value(raw).unwrap();
+        let resp = convert_response(api);
+        assert_eq!(resp.usage.input_tokens, 10);
+        assert_eq!(resp.usage.output_tokens, 5);
+        assert_eq!(resp.usage.cache_creation_input_tokens, 100);
+        assert_eq!(resp.usage.cache_read_input_tokens, 200);
+    }
+
+    #[test]
+    fn response_without_cache_usage_defaults_to_zero() {
+        let raw = json!({
+            "content": [{"type":"text","text":"ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let api: ApiResponse = serde_json::from_value(raw).unwrap();
+        let resp = convert_response(api);
+        assert_eq!(resp.usage.cache_creation_input_tokens, 0);
+        assert_eq!(resp.usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn streaming_usage_merges_cache_fields_across_message_start_and_delta() {
+        // message_start carries cache fields; message_delta does not.
+        // The running Usage must preserve cache fields through to the
+        // final emitted Usage event.
+        use std::collections::VecDeque;
+        let mut blocks: HashMap<usize, BlockState> = HashMap::new();
+        let mut buffer: VecDeque<Result<StreamEvent, ProviderError>> = VecDeque::new();
+        let mut running = Usage::default();
+
+        let start = StreamingPayload::MessageStart {
+            message: MessageStartPayload {
+                usage: Some(ApiUsage {
+                    input_tokens: 50,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 1000,
+                }),
+            },
+        };
+        process_payload(start, &mut blocks, &mut buffer, &mut running);
+
+        let delta = StreamingPayload::MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".into()),
+            },
+            usage: Some(ApiUsage {
+                input_tokens: 50,
+                output_tokens: 75,
+                // Crucially: API does NOT re-send cache fields here.
+                // serde(default) gives 0 — verifying merge_max keeps
+                // the prior 1000.
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+        };
+        process_payload(delta, &mut blocks, &mut buffer, &mut running);
+
+        // Drain Usage events; final emitted event should carry the
+        // merged values.
+        let usages: Vec<Usage> = buffer
+            .into_iter()
+            .filter_map(|r| match r.ok()? {
+                StreamEvent::Usage(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usages.len(), 2);
+        let last = usages.last().unwrap();
+        assert_eq!(last.input_tokens, 50);
+        assert_eq!(last.output_tokens, 75);
+        assert_eq!(last.cache_read_input_tokens, 1000);
     }
 }
