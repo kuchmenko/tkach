@@ -277,11 +277,22 @@ struct ApiUsage {
 fn build_request_body(request: &Request) -> ApiRequest {
     let mut messages: Vec<ApiMessage> = Vec::new();
 
-    if let Some(system) = request.system.as_ref() {
-        messages.push(ApiMessage::Simple {
-            role: "system",
-            content: system.clone(),
-        });
+    // OpenAI's chat-completions schema has a single string `system`
+    // field. Concatenate all SystemBlocks with `\n\n` and drop
+    // cache_control — non-Anthropic providers don't speak prompt
+    // caching.
+    if let Some(blocks) = request.system.as_ref() {
+        if !blocks.is_empty() {
+            let joined = blocks
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            messages.push(ApiMessage::Simple {
+                role: "system",
+                content: joined,
+            });
+        }
     }
 
     for msg in &request.messages {
@@ -324,7 +335,7 @@ fn extend_with_message(out: &mut Vec<ApiMessage>, msg: &Message) {
             let mut text_buf = String::new();
             for c in &msg.content {
                 match c {
-                    Content::Text { text } => {
+                    Content::Text { text, .. } => {
                         if !text_buf.is_empty() {
                             text_buf.push('\n');
                         }
@@ -334,6 +345,7 @@ fn extend_with_message(out: &mut Vec<ApiMessage>, msg: &Message) {
                         tool_use_id,
                         content,
                         is_error,
+                        ..
                     } => {
                         // Flush any pending user text before the tool results.
                         if !text_buf.is_empty() {
@@ -376,7 +388,7 @@ fn extend_with_message(out: &mut Vec<ApiMessage>, msg: &Message) {
             let mut tool_calls: Vec<ApiToolCallOut> = Vec::new();
             for c in &msg.content {
                 match c {
-                    Content::Text { text } => text_parts.push(text.clone()),
+                    Content::Text { text, .. } => text_parts.push(text.clone()),
                     Content::ToolUse { id, name, input } => {
                         tool_calls.push(ApiToolCallOut {
                             id: id.clone(),
@@ -426,7 +438,7 @@ fn convert_response(api: ApiResponse) -> Result<Response, ProviderError> {
     let mut content: Vec<Content> = Vec::new();
     if let Some(text) = choice.message.content {
         if !text.is_empty() {
-            content.push(Content::Text { text });
+            content.push(Content::text(text));
         }
     }
     for tc in choice.message.tool_calls {
@@ -469,6 +481,8 @@ fn convert_response(api: ApiResponse) -> Result<Response, ProviderError> {
         .map(|u| Usage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         })
         .unwrap_or_default();
 
@@ -681,6 +695,8 @@ fn process_chunk(
         buffer.push_back(Ok(StreamEvent::Usage(Usage {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         })));
     }
 }
@@ -728,12 +744,14 @@ fn map_finish_reason(reason: &str) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::CacheControl;
+    use crate::provider::SystemBlock;
 
     #[test]
     fn request_maps_system_and_user_text() {
         let req = Request {
             model: "gpt-4".into(),
-            system: Some("be brief".into()),
+            system: Some(vec![SystemBlock::text("be brief")]),
             messages: vec![Message::user_text("hi")],
             tools: vec![],
             max_tokens: 100,
@@ -748,6 +766,71 @@ mod tests {
         assert_eq!(json["messages"][1]["content"], "hi");
         assert_eq!(json["temperature"], 0.5);
         assert_eq!(json["max_tokens"], 100);
+    }
+
+    #[test]
+    fn multiple_system_blocks_concatenate_with_double_newline() {
+        let req = Request {
+            model: "gpt-4".into(),
+            system: Some(vec![
+                SystemBlock::text("base instructions"),
+                SystemBlock::cached("long stable context"),
+                SystemBlock::text("final tail"),
+            ]),
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["messages"][0]["role"], "system");
+        assert_eq!(
+            json["messages"][0]["content"],
+            "base instructions\n\nlong stable context\n\nfinal tail"
+        );
+        // cache_control silently dropped — OpenAI-compat has no equivalent.
+    }
+
+    #[test]
+    fn empty_system_vec_emits_no_system_message() {
+        let req = Request {
+            model: "gpt-4".into(),
+            system: Some(vec![]),
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn tool_definition_cache_control_is_ignored_silently() {
+        // Caller-set cache_control on a ToolDefinition should not break
+        // OpenAI-compat — the field is simply not threaded into the
+        // wire tool schema.
+        use crate::provider::ToolDefinition;
+        let req = Request {
+            model: "gpt-4".into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: vec![ToolDefinition {
+                name: "bash".into(),
+                description: "run a shell command".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: Some(CacheControl::ephemeral()),
+            }],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let tool = &json["tools"][0];
+        assert!(tool.get("cache_control").is_none());
+        assert_eq!(tool["function"]["name"], "bash");
     }
 
     #[test]
@@ -830,7 +913,7 @@ mod tests {
         assert_eq!(resp.usage.input_tokens, 10);
         assert_eq!(resp.usage.output_tokens, 3);
         match &resp.content[0] {
-            Content::Text { text } => assert_eq!(text, "calling a tool"),
+            Content::Text { text, .. } => assert_eq!(text, "calling a tool"),
             _ => panic!("expected text"),
         }
         match &resp.content[1] {

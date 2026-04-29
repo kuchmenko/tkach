@@ -9,7 +9,7 @@ use std::sync::{Arc, Once};
 
 use futures::StreamExt;
 use tkach::message::{Content, Message};
-use tkach::provider::Request;
+use tkach::provider::{Request, SystemBlock};
 use tkach::providers::{Anthropic, OpenAICompatible};
 use tkach::tools::SubAgent;
 use tkach::{Agent, AgentResult, CancellationToken, LlmProvider, StreamEvent};
@@ -473,7 +473,9 @@ async fn smoke_openai_compatible_roundtrip() {
     // be brief; we don't want the assertion to fight model verbosity.
     let request = Request {
         model: model.clone(),
-        system: Some("Reply with exactly the single word: PONG".into()),
+        system: Some(vec![SystemBlock::text(
+            "Reply with exactly the single word: PONG",
+        )]),
         messages: vec![Message::user_text("PING")],
         tools: vec![],
         max_tokens: 256,
@@ -489,7 +491,7 @@ async fn smoke_openai_compatible_roundtrip() {
         .content
         .iter()
         .filter_map(|c| match c {
-            Content::Text { text } => Some(text.as_str()),
+            Content::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -531,7 +533,7 @@ async fn smoke_anthropic_stream_roundtrip() {
 
     let request = Request {
         model: "claude-haiku-4-5-20251001".into(),
-        system: Some("Reply with exactly: PONG".into()),
+        system: Some(vec![SystemBlock::text("Reply with exactly: PONG")]),
         messages: vec![Message::user_text("PING")],
         tools: vec![],
         max_tokens: 32,
@@ -609,7 +611,9 @@ async fn smoke_openai_compatible_stream_roundtrip() {
 
     let request = Request {
         model: model.clone(),
-        system: Some("Reply with exactly the single word: PONG".into()),
+        system: Some(vec![SystemBlock::text(
+            "Reply with exactly the single word: PONG",
+        )]),
         messages: vec![Message::user_text("PING")],
         tools: vec![],
         max_tokens: 256,
