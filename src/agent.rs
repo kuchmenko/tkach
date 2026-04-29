@@ -613,12 +613,12 @@ impl AgentStream {
         match rx.await {
             Ok(result) => result,
             Err(_) => Err(AgentError::Cancelled {
-                partial: AgentResult {
+                partial: Box::new(AgentResult {
                     new_messages: Vec::new(),
                     text: String::new(),
                     usage: Usage::default(),
                     stop_reason: StopReason::Cancelled,
-                },
+                }),
             }),
         }
     }
@@ -635,12 +635,12 @@ impl AgentStream {
             .expect("collect_result called after into_result");
         rx.await.unwrap_or_else(|_| {
             Err(AgentError::Cancelled {
-                partial: AgentResult {
+                partial: Box::new(AgentResult {
                     new_messages: Vec::new(),
                     text: String::new(),
                     usage: Usage::default(),
                     stop_reason: StopReason::Cancelled,
-                },
+                }),
             })
         })
     }
@@ -651,13 +651,13 @@ fn build_partial(
     usage: &Usage,
     stop_reason: StopReason,
     text: &str,
-) -> AgentResult {
-    AgentResult {
+) -> Box<AgentResult> {
+    Box::new(AgentResult {
         new_messages: new_messages.to_vec(),
         text: text.to_string(),
         usage: usage.clone(),
         stop_reason,
-    }
+    })
 }
 
 fn extract_text(content: &[Content]) -> String {

@@ -6,9 +6,15 @@ use crate::agent::AgentResult;
 
 /// Error returned by [`crate::Agent::run`].
 ///
-/// Every variant carries a `partial: AgentResult` holding whatever delta
-/// was accumulated before the failure. Callers that maintain their own
-/// history (the stateless-agent contract) can persist progress on error:
+/// Every variant carries a `partial: Box<AgentResult>` holding whatever
+/// delta was accumulated before the failure. The `Box` keeps `AgentError`
+/// small enough to satisfy `clippy::result_large_err` — `AgentResult` is
+/// ~72 bytes and would otherwise push the enum past the 128-byte
+/// stack-Result threshold. Accessors auto-deref the box, so most callers
+/// see `&AgentResult` and don't need to think about the indirection.
+///
+/// Callers that maintain their own history (the stateless-agent contract)
+/// can persist progress on error:
 ///
 /// ```ignore
 /// let delta = match agent.run(history.clone(), cancel).await {
@@ -21,24 +27,27 @@ use crate::agent::AgentResult;
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("max turns ({turns}) reached without completion")]
-    MaxTurnsReached { turns: usize, partial: AgentResult },
+    MaxTurnsReached {
+        turns: usize,
+        partial: Box<AgentResult>,
+    },
 
     #[error("provider error: {source}")]
     Provider {
         #[source]
         source: ProviderError,
-        partial: AgentResult,
+        partial: Box<AgentResult>,
     },
 
     #[error("cancelled")]
-    Cancelled { partial: AgentResult },
+    Cancelled { partial: Box<AgentResult> },
 
     #[error("tool '{tool_name}' failed: {source}")]
     Tool {
         tool_name: String,
         #[source]
         source: ToolError,
-        partial: AgentResult,
+        partial: Box<AgentResult>,
     },
 }
 
@@ -59,7 +68,7 @@ impl AgentError {
             AgentError::MaxTurnsReached { partial, .. }
             | AgentError::Provider { partial, .. }
             | AgentError::Cancelled { partial }
-            | AgentError::Tool { partial, .. } => partial,
+            | AgentError::Tool { partial, .. } => *partial,
         }
     }
 }
