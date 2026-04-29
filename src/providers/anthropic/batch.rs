@@ -388,12 +388,19 @@ impl Anthropic {
 
         let status = response.status().as_u16();
         if status >= 400 {
-            // Anthropic returns 4xx with a body when the batch isn't
-            // ready yet. Probe by re-fetching the handle so we can
-            // surface a structured BatchNotReady instead of a vanilla
-            // ApiError when that's the actual cause.
             let api_err = read_api_error(response).await;
-            return Err(promote_not_ready(self, id, api_err).await);
+            // Only plain "not ready" 4xx codes (400 / 404) warrant the
+            // probe — those are what Anthropic returns when /results is
+            // hit before the batch reaches `ended`. 429 and 5xx (incl.
+            // Anthropic's 529) are retryable transport pressure
+            // signals; masking them as `BatchNotReady` would flip
+            // `is_retryable` to false and discard `retry_after_ms`,
+            // pushing callers into aggressive polling against an
+            // already-overloaded server.
+            if is_premature_results_status(status) {
+                return Err(promote_not_ready(self, id, api_err).await);
+            }
+            return Err(api_err);
         }
 
         let bytes = response.bytes_stream();
@@ -496,6 +503,14 @@ async fn read_api_error(response: reqwest::Response) -> ProviderError {
     let retry_after_ms = parse_retry_after(response.headers());
     let text = response.text().await.unwrap_or_default();
     classify_error(status, text, retry_after_ms)
+}
+
+/// HTTP status codes Anthropic uses for the "results not ready yet"
+/// signal on `/v1/messages/batches/{id}/results`. 429 and 5xx are
+/// deliberately excluded — they're retryable transport pressure, not
+/// not-ready, and would lose their retry-after hints if promoted.
+fn is_premature_results_status(status: u16) -> bool {
+    matches!(status, 400 | 404)
 }
 
 /// If the caller hit `batch_results` while the batch was still

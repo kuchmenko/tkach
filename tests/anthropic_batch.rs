@@ -246,6 +246,87 @@ async fn premature_batch_results_surfaces_batch_not_ready() {
     }
 }
 
+#[tokio::test]
+async fn batch_results_429_surfaces_rate_limit_not_batch_not_ready() {
+    // Regression: previously every non-2xx /results response was probed
+    // for the in_progress/canceling state and promoted to BatchNotReady,
+    // which masked retryable transport errors (429, 5xx) and discarded
+    // retry_after_ms. 429 must pass through unchanged so callers back
+    // off using the server's hint instead of polling aggressively.
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/messages/batches/b1/results"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "8")
+                .set_body_string(r#"{"error":{"message":"slow down"}}"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Critically: do NOT mount /v1/messages/batches/b1 (the handle
+    // probe) — if the bug regresses, the test fails on missing mock.
+    Mock::given(method("GET"))
+        .and(path("/v1/messages/batches/b1"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = anthropic(&server);
+    let result = client.batch_results("b1").await;
+    match result {
+        Ok(_) => panic!("expected RateLimit, got Ok stream"),
+        Err(ProviderError::RateLimit { retry_after_ms }) => {
+            assert_eq!(retry_after_ms, Some(8_000));
+        }
+        Err(ProviderError::BatchNotReady { .. }) => {
+            panic!("BUG: 429 incorrectly promoted to BatchNotReady");
+        }
+        Err(other) => panic!("expected RateLimit, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn batch_results_5xx_surfaces_retryable_api_error_not_batch_not_ready() {
+    // Same regression class as the 429 case: 502 must pass through
+    // with retryable=true so callers backoff-and-retry, not flip into
+    // not-ready polling.
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/messages/batches/b1/results"))
+        .respond_with(ResponseTemplate::new(502).set_body_string("upstream"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/messages/batches/b1"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = anthropic(&server);
+    let result = client.batch_results("b1").await;
+    match result {
+        Ok(_) => panic!("expected Api(502), got Ok stream"),
+        Err(ProviderError::Api {
+            status, retryable, ..
+        }) => {
+            assert_eq!(status, 502);
+            assert!(retryable);
+        }
+        Err(ProviderError::BatchNotReady { .. }) => {
+            panic!("BUG: 502 incorrectly promoted to BatchNotReady");
+        }
+        Err(other) => panic!("expected Api, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error classification on batch endpoints
 // ---------------------------------------------------------------------------
