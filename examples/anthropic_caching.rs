@@ -14,12 +14,18 @@
 //!   - the user message
 //!
 //! Model & size: Anthropic enforces a **minimum cacheable prefix
-//! size** at the breakpoint. The official docs quote 1024 tokens for
-//! Sonnet/Opus and 2048 for Haiku, but in practice the API silently
-//! skips caching for prefixes below ~2048 tokens on both Sonnet 4.6
-//! and Haiku 4.5 (verified empirically: 1216 tokens → no cache,
-//! 2400 tokens → cache works). The example pads the system block to
-//! ~4000 tokens for comfortable headroom across model variants.
+//! size** at the breakpoint. Per official docs (2026-04-30):
+//!   - Claude Sonnet 4.6          → 2,048 tokens minimum
+//!   - Claude Haiku 4.5           → 4,096 tokens minimum
+//!   - Claude Opus 4.x            → 4,096 tokens minimum
+//!   - Claude Haiku 3.5           → 2,048 tokens minimum
+//!   - Claude Sonnet 4.5 / 3.7    → 1,024 tokens minimum
+//!
+//! The API silently skips caching (cache_creation_input_tokens=0)
+//! when the prefix is below the threshold. The example uses Sonnet 4.6
+//! (2,048 minimum) and pads the system block to ~2,783 tokens —
+//! comfortably above the threshold without requiring a larger build.
+//! Switch to Haiku 4.5 only after padding to 4,096+ tokens.
 //!
 //! Run with:
 //!   ANTHROPIC_API_KEY=sk-... cargo run --example anthropic_caching
@@ -57,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         messages: vec![Message::user_text(user)],
         tools: tools.clone(),
         max_tokens: 64,
-        temperature: Some(0.0),
+        temperature: None,
     };
 
     println!("=== first call (cache write) ===");
