@@ -200,6 +200,8 @@ while let Some(event) = stream.next().await {
 let result = stream.into_result().await?;        // final AgentResult
 ```
 
+`ThinkingDelta` and `ThinkingBlock` are public `StreamEvent` variants. Downstream exhaustive matches must add arms for them when upgrading.
+
 Backpressure is real: a slow consumer parks the producer task, which closes the SSE read side, which lets the OS shrink the TCP receive window — all the way back to the LLM server. Cancellation works mid-stream too: `cancel.cancel()` aborts the current SSE pull within milliseconds via `tokio::select!`.
 
 See [`examples/streaming_cancel.rs`](./examples/streaming_cancel.rs) for live cancel timing.
@@ -272,10 +274,10 @@ Each runnable demo also asserts its invariants — `cargo run --example NAME` ei
 | Example | What it shows |
 |---|---|
 | [`basic.rs`](./examples/basic.rs) | Minimal `agent.run` |
-| [`streaming.rs`](./examples/streaming.rs) | Live token streaming |
+| [`streaming.rs`](./examples/streaming.rs) | Anthropic streaming with visible/thinking event handling |
 | [`streaming_multi_tool.rs`](./examples/streaming_multi_tool.rs) | Multi-turn write→edit→read chain via `Agent::stream` |
 | [`streaming_subagent.rs`](./examples/streaming_subagent.rs) | Sonnet streams, delegates to a Haiku sub-agent |
-| [`streaming_openai_tools.rs`](./examples/streaming_openai_tools.rs) | OpenAI-compatible tool call (works through OpenRouter) |
+| [`streaming_openai_tools.rs`](./examples/streaming_openai_tools.rs) | OpenAI-compatible tool call + no-thinking contract (works through OpenRouter) |
 | [`streaming_cancel.rs`](./examples/streaming_cancel.rs) | Cancel mid-generation, partial text preserved |
 | [`streaming_resilience.rs`](./examples/streaming_resilience.rs) | Tool failure + cancel-during-tool + multi-block turns |
 | [`approval_flow.rs`](./examples/approval_flow.rs) | Live denial flow with custom `ApprovalHandler` |

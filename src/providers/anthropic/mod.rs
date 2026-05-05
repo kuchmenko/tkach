@@ -590,17 +590,7 @@ pub(crate) struct ApiUsage {
 // --- Conversion ---
 
 pub(crate) fn build_request_body(request: &Request) -> ApiRequest {
-    let messages = request
-        .messages
-        .iter()
-        .map(|msg| ApiMessage {
-            role: match msg.role {
-                crate::message::Role::User => "user".to_string(),
-                crate::message::Role::Assistant => "assistant".to_string(),
-            },
-            content: msg.content.iter().filter_map(content_to_api).collect(),
-        })
-        .collect();
+    let messages = request.messages.iter().filter_map(message_to_api).collect();
 
     let tools = request
         .tools
@@ -631,6 +621,21 @@ pub(crate) fn build_request_body(request: &Request) -> ApiRequest {
         temperature: request.temperature,
         stream: false,
     }
+}
+
+fn message_to_api(msg: &crate::message::Message) -> Option<ApiMessage> {
+    let content: Vec<ApiContent> = msg.content.iter().filter_map(content_to_api).collect();
+    if content.is_empty() {
+        return None;
+    }
+
+    Some(ApiMessage {
+        role: match msg.role {
+            crate::message::Role::User => "user".to_string(),
+            crate::message::Role::Assistant => "assistant".to_string(),
+        },
+        content,
+    })
 }
 
 fn content_to_api(content: &Content) -> Option<ApiContent> {
@@ -859,6 +864,60 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_thinking_content_serializes_with_signature() {
+        let req = Request {
+            model: "m".into(),
+            system: None,
+            messages: vec![Message::assistant(vec![
+                Content::thinking(
+                    "reason",
+                    ThinkingProvider::Anthropic,
+                    ThinkingMetadata::anthropic(Some("sig".into())),
+                ),
+                Content::text("visible"),
+            ])],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let content = json["messages"][0]["content"].as_array().unwrap();
+
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "reason");
+        assert_eq!(content[0]["signature"], "sig");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "visible");
+    }
+
+    #[test]
+    fn foreign_thinking_only_message_is_not_serialized_as_empty_message() {
+        let req = Request {
+            model: "m".into(),
+            system: None,
+            messages: vec![
+                Message::assistant(vec![Content::thinking(
+                    "foreign",
+                    ThinkingProvider::OpenAIResponses,
+                    ThinkingMetadata::openai_responses(Some("rs_1".into()), None, 0, None),
+                )]),
+                Message::user_text("next"),
+            ],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "next");
+    }
+
+    #[test]
     fn response_with_cache_usage_parses_all_four_fields() {
         let raw = json!({
             "content": [{"type":"text","text":"ok"}],
@@ -953,6 +1012,56 @@ mod tests {
                 },
             } if text == "reason" && signature == "sig"
         ));
+    }
+
+    #[test]
+    fn streaming_signature_without_thinking_delta_preserves_empty_block() {
+        use std::collections::VecDeque;
+        let mut blocks: HashMap<usize, BlockState> = HashMap::new();
+        let mut buffer: VecDeque<Result<StreamEvent, ProviderError>> = VecDeque::new();
+        let mut running = Usage::default();
+
+        process_payload(
+            StreamingPayload::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlockStart::Thinking {
+                    thinking: String::new(),
+                    signature: String::new(),
+                },
+            },
+            &mut blocks,
+            &mut buffer,
+            &mut running,
+        );
+        process_payload(
+            StreamingPayload::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::Signature {
+                    signature: "sig-only".into(),
+                },
+            },
+            &mut blocks,
+            &mut buffer,
+            &mut running,
+        );
+        process_payload(
+            StreamingPayload::ContentBlockStop { index: 0 },
+            &mut blocks,
+            &mut buffer,
+            &mut running,
+        );
+
+        assert!(matches!(
+            buffer.pop_front().unwrap().unwrap(),
+            StreamEvent::ThinkingBlock {
+                text,
+                provider: ThinkingProvider::Anthropic,
+                metadata: ThinkingMetadata::Anthropic {
+                    signature: Some(signature),
+                },
+            } if text.is_empty() && signature == "sig-only"
+        ));
+        assert!(buffer.is_empty());
     }
 
     #[test]
