@@ -5,7 +5,6 @@ use std::task::{Context, Poll};
 
 use futures::Stream;
 use futures::StreamExt;
-use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -282,9 +281,10 @@ impl Agent {
     /// consumers see only what they can render to the user.
     ///
     /// History accumulation happens silently: text deltas are joined
-    /// into a single `Content::Text` block per turn before being added
-    /// to `new_messages`, so the next turn's request to the provider
-    /// sees a clean conversation history.
+    /// into `Content::Text` blocks and finalized thinking blocks are
+    /// preserved separately, in provider order, before being added to
+    /// `new_messages`, so the next turn's request to the provider sees
+    /// a clean conversation history.
     ///
     /// Call [`AgentStream::into_result`] (or `.collect_result()`) after
     /// the stream ends to receive the final [`AgentResult`] with
@@ -364,10 +364,14 @@ impl Agent {
                 }
             };
 
-            // Per-turn accumulators. Text deltas concatenate into a
-            // single Text block; tool_uses preserve LLM-issued order.
-            let mut text_buf = String::new();
-            let mut tool_uses: Vec<(String, String, Value)> = Vec::new();
+            // Per-turn accumulators. Visible text is tracked both as
+            // `turn_text` for AgentResult.text and as ordered Text blocks
+            // inside assistant_content. Thinking blocks are finalized by
+            // provider events so signatures / replay metadata survive.
+            let mut turn_text = String::new();
+            let mut current_text_buf = String::new();
+            let mut assistant_content: Vec<Content> = Vec::new();
+            let mut tool_uses: Vec<ToolCall> = Vec::new();
             let mut turn_stop: Option<StopReason> = None;
             let mut turn_usage = Usage::default();
 
@@ -389,7 +393,7 @@ impl Agent {
                                 &new_messages,
                                 &total_usage,
                                 StopReason::Cancelled,
-                                &text_buf,
+                                &turn_text,
                             ),
                         });
                     }
@@ -407,7 +411,7 @@ impl Agent {
                                 &new_messages,
                                 &total_usage,
                                 last_stop.unwrap_or(FALLBACK_STOP_REASON),
-                                &text_buf,
+                                &turn_text,
                             ),
                         });
                     }
@@ -415,7 +419,8 @@ impl Agent {
 
                 match ev {
                     StreamEvent::ContentDelta(delta) => {
-                        text_buf.push_str(&delta);
+                        turn_text.push_str(&delta);
+                        current_text_buf.push_str(&delta);
                         if events_tx
                             .send(Ok(StreamEvent::ContentDelta(delta)))
                             .await
@@ -427,13 +432,76 @@ impl Agent {
                                     &new_messages,
                                     &total_usage,
                                     StopReason::Cancelled,
-                                    &text_buf,
+                                    &turn_text,
+                                ),
+                            });
+                        }
+                    }
+                    StreamEvent::ThinkingDelta { text } => {
+                        if events_tx
+                            .send(Ok(StreamEvent::ThinkingDelta { text }))
+                            .await
+                            .is_err()
+                        {
+                            return Err(AgentError::Cancelled {
+                                partial: build_partial(
+                                    &new_messages,
+                                    &total_usage,
+                                    StopReason::Cancelled,
+                                    &turn_text,
+                                ),
+                            });
+                        }
+                    }
+                    StreamEvent::ThinkingBlock {
+                        text,
+                        provider,
+                        metadata,
+                    } => {
+                        if !current_text_buf.is_empty() {
+                            assistant_content
+                                .push(Content::text(std::mem::take(&mut current_text_buf)));
+                        }
+                        assistant_content.push(Content::Thinking {
+                            text: text.clone(),
+                            provider,
+                            metadata: metadata.clone(),
+                        });
+                        if events_tx
+                            .send(Ok(StreamEvent::ThinkingBlock {
+                                text,
+                                provider,
+                                metadata,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            return Err(AgentError::Cancelled {
+                                partial: build_partial(
+                                    &new_messages,
+                                    &total_usage,
+                                    StopReason::Cancelled,
+                                    &turn_text,
                                 ),
                             });
                         }
                     }
                     StreamEvent::ToolUse { id, name, input } => {
-                        tool_uses.push((id.clone(), name.clone(), input.clone()));
+                        if !current_text_buf.is_empty() {
+                            assistant_content
+                                .push(Content::text(std::mem::take(&mut current_text_buf)));
+                        }
+                        let call = ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        };
+                        tool_uses.push(call);
+                        assistant_content.push(Content::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        });
                         if events_tx
                             .send(Ok(StreamEvent::ToolUse { id, name, input }))
                             .await
@@ -444,7 +512,7 @@ impl Agent {
                                     &new_messages,
                                     &total_usage,
                                     StopReason::Cancelled,
-                                    &text_buf,
+                                    &turn_text,
                                 ),
                             });
                         }
@@ -467,6 +535,9 @@ impl Agent {
                     StreamEvent::ToolCallPending { .. } => {}
                 }
             }
+            if !current_text_buf.is_empty() {
+                assistant_content.push(Content::text(current_text_buf));
+            }
             // Drop provider_stream to free the underlying HTTP
             // connection before the next turn opens a new one.
             drop(provider_stream);
@@ -475,20 +546,6 @@ impl Agent {
             let resolved_stop = turn_stop.unwrap_or(StopReason::EndTurn);
             last_stop = Some(resolved_stop);
 
-            // Build assistant message: text first (single joined block),
-            // then tool_use blocks in LLM-issued order. Mirrors how
-            // Anthropic's complete() returns content.
-            let mut assistant_content: Vec<Content> = Vec::new();
-            if !text_buf.is_empty() {
-                assistant_content.push(Content::text(text_buf.clone()));
-            }
-            for (id, name, input) in &tool_uses {
-                assistant_content.push(Content::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                });
-            }
             let assistant_msg = Message::assistant(assistant_content);
             history.push(assistant_msg.clone());
             new_messages.push(assistant_msg);
@@ -497,7 +554,7 @@ impl Agent {
                 info!(turn, "agent stream finished");
                 return Ok(AgentResult {
                     new_messages,
-                    text: text_buf,
+                    text: turn_text,
                     usage: total_usage,
                     stop_reason: resolved_stop,
                 });
@@ -513,10 +570,7 @@ impl Agent {
             }
 
             debug!(count = tool_uses.len(), "executing tool batch (stream)");
-            let calls: Vec<ToolCall> = tool_uses
-                .into_iter()
-                .map(|(id, name, input)| ToolCall { id, name, input })
-                .collect();
+            let calls = tool_uses;
 
             // Emit one `ToolCallPending` per call before invoking the
             // executor. The consumer's UI uses this to render an
@@ -544,7 +598,7 @@ impl Agent {
                             &new_messages,
                             &total_usage,
                             StopReason::Cancelled,
-                            &text_buf,
+                            &turn_text,
                         ),
                     });
                 }

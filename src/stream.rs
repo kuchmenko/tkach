@@ -18,7 +18,7 @@ use futures::stream::Stream;
 use serde_json::Value;
 
 use crate::error::ProviderError;
-use crate::message::{StopReason, Usage};
+use crate::message::{StopReason, ThinkingMetadata, ThinkingProvider, Usage};
 use crate::tool::ToolClass;
 
 /// One unit of progress from a streaming provider.
@@ -34,6 +34,24 @@ pub enum StreamEvent {
     /// A piece of assistant text. Concatenate in order to reconstruct
     /// the full reply.
     ContentDelta(String),
+
+    /// A piece of provider-visible thinking/reasoning summary text.
+    ///
+    /// This is not raw hidden chain-of-thought. Providers should emit
+    /// this only for reasoning content the API explicitly returns and
+    /// the provider adapter has chosen to expose.
+    ThinkingDelta { text: String },
+
+    /// A finalized thinking/reasoning block with provider replay state.
+    ///
+    /// `ThinkingDelta` is for live UI progress; `ThinkingBlock` is for
+    /// preserving a complete block in [`crate::Content`] so callers can
+    /// replay sessions without mixing thinking into visible answer text.
+    ThinkingBlock {
+        text: String,
+        provider: ThinkingProvider,
+        metadata: ThinkingMetadata,
+    },
 
     /// A complete tool invocation request. The agent loop will execute
     /// it and feed the result back on the next turn.

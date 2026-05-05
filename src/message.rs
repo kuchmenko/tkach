@@ -24,6 +24,13 @@ pub enum Content {
         cache_control: Option<CacheControl>,
     },
 
+    #[serde(rename = "thinking")]
+    Thinking {
+        text: String,
+        provider: ThinkingProvider,
+        metadata: ThinkingMetadata,
+    },
+
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -39,6 +46,43 @@ pub enum Content {
         is_error: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+    },
+}
+
+/// Provider that produced a persisted thinking/reasoning block.
+///
+/// Thinking blocks are protocol state, not just UI decoration: Anthropic
+/// needs signatures, while OpenAI Responses/Codex can need reasoning item
+/// IDs and encrypted replay state. Keeping provider identity typed avoids
+/// accidentally replaying one provider's opaque state through another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingProvider {
+    Anthropic,
+    #[serde(rename = "openai_responses")]
+    OpenAIResponses,
+    #[serde(rename = "openai_compatible")]
+    OpenAICompatible,
+}
+
+/// Provider-specific metadata for a completed thinking/reasoning block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingMetadata {
+    None,
+    Anthropic {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    #[serde(rename = "openai_responses")]
+    OpenAIResponses {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_index: Option<usize>,
+        summary_index: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
     },
 }
 
@@ -175,6 +219,26 @@ impl Usage {
     }
 }
 
+impl ThinkingMetadata {
+    pub fn anthropic(signature: Option<String>) -> Self {
+        ThinkingMetadata::Anthropic { signature }
+    }
+
+    pub fn openai_responses(
+        item_id: Option<String>,
+        output_index: Option<usize>,
+        summary_index: usize,
+        encrypted_content: Option<String>,
+    ) -> Self {
+        ThinkingMetadata::OpenAIResponses {
+            item_id,
+            output_index,
+            summary_index,
+            encrypted_content,
+        }
+    }
+}
+
 // --- Constructors ---
 
 impl Message {
@@ -231,6 +295,18 @@ impl Content {
         }
     }
 
+    pub fn thinking(
+        text: impl Into<String>,
+        provider: ThinkingProvider,
+        metadata: ThinkingMetadata,
+    ) -> Self {
+        Content::Thinking {
+            text: text.into(),
+            provider,
+            metadata,
+        }
+    }
+
     /// Text block marked as a cache breakpoint with the default 5m TTL.
     pub fn text_cached(text: impl Into<String>) -> Self {
         Content::Text {
@@ -249,6 +325,53 @@ impl Content {
             content: content.into(),
             is_error,
             cache_control: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_content_serializes_with_provider_metadata() {
+        let content = Content::thinking(
+            "inspected repo",
+            ThinkingProvider::OpenAIResponses,
+            ThinkingMetadata::openai_responses(
+                Some("rs_123".into()),
+                None,
+                0,
+                Some("encrypted".into()),
+            ),
+        );
+
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["type"], "thinking");
+        assert_eq!(json["provider"], "openai_responses");
+        assert_eq!(json["metadata"]["type"], "openai_responses");
+        assert_eq!(json["metadata"]["item_id"], "rs_123");
+
+        let roundtrip: Content = serde_json::from_value(json).unwrap();
+        match roundtrip {
+            Content::Thinking {
+                text,
+                provider,
+                metadata,
+            } => {
+                assert_eq!(text, "inspected repo");
+                assert_eq!(provider, ThinkingProvider::OpenAIResponses);
+                assert_eq!(
+                    metadata,
+                    ThinkingMetadata::OpenAIResponses {
+                        item_id: Some("rs_123".into()),
+                        output_index: None,
+                        summary_index: 0,
+                        encrypted_content: Some("encrypted".into()),
+                    }
+                );
+            }
+            other => panic!("expected thinking, got {other:?}"),
         }
     }
 }

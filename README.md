@@ -174,7 +174,14 @@ let mut stream = agent.stream(history, CancellationToken::new());
 while let Some(event) = stream.next().await {
     match event? {
         StreamEvent::ContentDelta(text) => {
-            print!("{text}");                    // live tokens
+            print!("{text}");                    // visible answer tokens
+        }
+        StreamEvent::ThinkingDelta { text } => {
+            eprint!("[thinking] {text}");         // provider-returned summary, not final text
+        }
+        StreamEvent::ThinkingBlock { .. } => {
+            // Finalized thinking/reasoning block with replay metadata.
+            // Persisted in AgentResult.new_messages, excluded from AgentResult.text.
         }
         StreamEvent::ToolUse { id, name, input } => {
             // Atomic: parser accumulated all `input_json_delta` chunks

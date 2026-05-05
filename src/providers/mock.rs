@@ -113,6 +113,18 @@ fn response_to_events(response: Response) -> Vec<StreamEvent> {
     for content in response.content {
         match content {
             Content::Text { text, .. } => events.push(StreamEvent::ContentDelta(text)),
+            Content::Thinking {
+                text,
+                provider,
+                metadata,
+            } => {
+                events.push(StreamEvent::ThinkingDelta { text: text.clone() });
+                events.push(StreamEvent::ThinkingBlock {
+                    text,
+                    provider,
+                    metadata,
+                });
+            }
             Content::ToolUse { id, name, input } => {
                 events.push(StreamEvent::ToolUse { id, name, input })
             }
