@@ -45,7 +45,10 @@ pub use agent::{Agent, AgentBuilder, AgentResult, AgentStream};
 pub use approval::{ApprovalDecision, ApprovalHandler, AutoApprove};
 pub use error::{AgentError, ProviderError, ToolError};
 pub use executor::{AllowAll, ToolCall, ToolExecutor, ToolPolicy, ToolRegistry};
-pub use message::{CacheControl, CacheTtl, Content, Message, Role, StopReason, Usage};
+pub use message::{
+    CacheControl, CacheTtl, Content, Message, Role, StopReason, ThinkingMetadata, ThinkingProvider,
+    Usage,
+};
 pub use provider::{LlmProvider, Request, Response, SystemBlock, ToolDefinition};
 pub use stream::{ProviderEventStream, StreamEvent};
 pub use tokio_util::sync::CancellationToken;

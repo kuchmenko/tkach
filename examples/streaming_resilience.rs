@@ -307,6 +307,7 @@ async fn phase3_multi_block(provider: &Arc<Anthropic>) -> Result<(), Box<dyn std
                 .iter()
                 .map(|c| match c {
                     Content::Text { .. } => "Text",
+                    Content::Thinking { .. } => "Thinking",
                     Content::ToolUse { .. } => "ToolUse",
                     Content::ToolResult { .. } => "ToolResult",
                 })

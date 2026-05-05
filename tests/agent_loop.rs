@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::StreamExt;
 use serde_json::json;
-use tkach::message::{Content, Message, StopReason, Usage};
+use tkach::message::{Content, Message, StopReason, ThinkingMetadata, ThinkingProvider, Usage};
 use tkach::provider::Response;
 use tkach::providers::Mock;
 use tkach::{Agent, AgentError, CancellationToken, StreamEvent};
@@ -650,6 +650,88 @@ async fn stream_text_response_emits_delta_then_collects_result() {
     assert_eq!(result.new_messages.len(), 1);
     assert_eq!(result.text, "Hello, world!");
     assert_eq!(result.stop_reason, StopReason::EndTurn);
+}
+
+#[tokio::test]
+async fn stream_thinking_response_forwards_live_and_preserves_history() {
+    let thinking = Content::thinking(
+        "I should inspect the repo first.",
+        ThinkingProvider::OpenAIResponses,
+        ThinkingMetadata::openai_responses(Some("rs_1".into()), None, 0, Some("enc".into())),
+    );
+
+    let agent = Agent::builder()
+        .provider(Mock::new(move |_req| {
+            Ok(Response {
+                content: vec![thinking.clone(), Content::text("Done.")],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }))
+        .model("test")
+        .working_dir(test_dir())
+        .build();
+
+    let mut stream = agent.stream(prompt("hi"), CancellationToken::new());
+    let mut saw_delta = false;
+    let mut saw_block = false;
+    let mut visible = String::new();
+    while let Some(ev) = stream.next().await {
+        match ev.unwrap() {
+            StreamEvent::ThinkingDelta { text } => {
+                assert_eq!(text, "I should inspect the repo first.");
+                saw_delta = true;
+            }
+            StreamEvent::ThinkingBlock {
+                text,
+                provider,
+                metadata,
+            } => {
+                assert_eq!(text, "I should inspect the repo first.");
+                assert_eq!(provider, ThinkingProvider::OpenAIResponses);
+                assert_eq!(
+                    metadata,
+                    ThinkingMetadata::OpenAIResponses {
+                        item_id: Some("rs_1".into()),
+                        output_index: None,
+                        summary_index: 0,
+                        encrypted_content: Some("enc".into()),
+                    }
+                );
+                saw_block = true;
+            }
+            StreamEvent::ContentDelta(text) => visible.push_str(&text),
+            _ => {}
+        }
+    }
+    let result = stream.into_result().await.unwrap();
+
+    assert!(saw_delta, "consumer should see live thinking progress");
+    assert!(saw_block, "consumer should see finalized thinking metadata");
+    assert_eq!(visible, "Done.");
+    assert_eq!(result.text, "Done.");
+    assert_eq!(result.new_messages.len(), 1);
+    let contents = &result.new_messages[0].content;
+    assert_eq!(contents.len(), 2);
+    assert!(matches!(
+        &contents[0],
+        Content::Thinking {
+            text,
+            provider: ThinkingProvider::OpenAIResponses,
+            metadata: ThinkingMetadata::OpenAIResponses {
+                item_id,
+                output_index: None,
+                summary_index: 0,
+                encrypted_content,
+            },
+        } if text == "I should inspect the repo first."
+            && item_id.as_deref() == Some("rs_1")
+            && encrypted_content.as_deref() == Some("enc")
+    ));
+    assert!(matches!(
+        &contents[1],
+        Content::Text { text, .. } if text == "Done."
+    ));
 }
 
 #[tokio::test]

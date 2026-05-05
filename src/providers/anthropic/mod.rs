@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ProviderError;
-use crate::message::{CacheControl, Content, StopReason, Usage};
+use crate::message::{
+    CacheControl, Content, StopReason, ThinkingMetadata, ThinkingProvider, Usage,
+};
 use crate::provider::{LlmProvider, Request, Response, SystemBlock};
 use crate::stream::{ProviderEventStream, StreamEvent};
 
@@ -223,6 +225,13 @@ struct MessageStartPayload {
 enum ContentBlockStart {
     #[serde(rename = "text")]
     Text,
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default)]
+        signature: String,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -236,9 +245,13 @@ enum ContentBlockStart {
 #[serde(tag = "type")]
 enum BlockDelta {
     #[serde(rename = "text_delta")]
-    TextDelta { text: String },
+    Text { text: String },
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: String },
+    #[serde(rename = "signature_delta")]
+    Signature { signature: String },
     #[serde(rename = "input_json_delta")]
-    InputJsonDelta { partial_json: String },
+    InputJson { partial_json: String },
 }
 
 #[derive(Deserialize)]
@@ -260,6 +273,10 @@ struct ErrorPayload {
 /// fragments and emit one atomic `ToolUse` event on `content_block_stop`.
 enum BlockState {
     Text,
+    Thinking {
+        text_buf: String,
+        signature: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -355,6 +372,13 @@ fn process_payload(
         } => {
             let state = match content_block {
                 ContentBlockStart::Text => BlockState::Text,
+                ContentBlockStart::Thinking {
+                    thinking,
+                    signature,
+                } => BlockState::Thinking {
+                    text_buf: thinking,
+                    signature,
+                },
                 ContentBlockStart::ToolUse { id, name, input } => BlockState::ToolUse {
                     id,
                     name,
@@ -371,24 +395,52 @@ fn process_payload(
             blocks.insert(index, state);
         }
         StreamingPayload::ContentBlockDelta { index, delta } => match delta {
-            BlockDelta::TextDelta { text } => {
+            BlockDelta::Text { text } => {
                 buffer.push_back(Ok(StreamEvent::ContentDelta(text)));
             }
-            BlockDelta::InputJsonDelta { partial_json } => {
+            BlockDelta::Thinking { thinking } => {
+                if let Some(BlockState::Thinking { text_buf, .. }) = blocks.get_mut(&index) {
+                    text_buf.push_str(&thinking);
+                }
+                buffer.push_back(Ok(StreamEvent::ThinkingDelta { text: thinking }));
+            }
+            BlockDelta::Signature { signature } => {
+                if let Some(BlockState::Thinking { signature: sig, .. }) = blocks.get_mut(&index) {
+                    sig.push_str(&signature);
+                }
+            }
+            BlockDelta::InputJson { partial_json } => {
                 if let Some(BlockState::ToolUse { json_buf, .. }) = blocks.get_mut(&index) {
                     json_buf.push_str(&partial_json);
                 }
             }
         },
         StreamingPayload::ContentBlockStop { index } => {
-            if let Some(BlockState::ToolUse { id, name, json_buf }) = blocks.remove(&index) {
-                let input: Value = if json_buf.trim().is_empty() {
-                    Value::Object(Default::default())
-                } else {
-                    serde_json::from_str(&json_buf)
-                        .unwrap_or_else(|_| Value::String(json_buf.clone()))
-                };
-                buffer.push_back(Ok(StreamEvent::ToolUse { id, name, input }));
+            if let Some(block) = blocks.remove(&index) {
+                match block {
+                    BlockState::Text => {}
+                    BlockState::Thinking {
+                        text_buf,
+                        signature,
+                    } => {
+                        buffer.push_back(Ok(StreamEvent::ThinkingBlock {
+                            text: text_buf,
+                            provider: ThinkingProvider::Anthropic,
+                            metadata: ThinkingMetadata::Anthropic {
+                                signature: (!signature.is_empty()).then_some(signature),
+                            },
+                        }));
+                    }
+                    BlockState::ToolUse { id, name, json_buf } => {
+                        let input: Value = if json_buf.trim().is_empty() {
+                            Value::Object(Default::default())
+                        } else {
+                            serde_json::from_str(&json_buf)
+                                .unwrap_or_else(|_| Value::String(json_buf.clone()))
+                        };
+                        buffer.push_back(Ok(StreamEvent::ToolUse { id, name, input }));
+                    }
+                }
             }
         }
         StreamingPayload::MessageDelta { delta, usage } => {
@@ -474,6 +526,13 @@ pub(crate) enum ApiContent {
         cache_control: Option<CacheControl>,
     },
 
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -531,17 +590,7 @@ pub(crate) struct ApiUsage {
 // --- Conversion ---
 
 pub(crate) fn build_request_body(request: &Request) -> ApiRequest {
-    let messages = request
-        .messages
-        .iter()
-        .map(|msg| ApiMessage {
-            role: match msg.role {
-                crate::message::Role::User => "user".to_string(),
-                crate::message::Role::Assistant => "assistant".to_string(),
-            },
-            content: msg.content.iter().map(content_to_api).collect(),
-        })
-        .collect();
+    let messages = request.messages.iter().filter_map(message_to_api).collect();
 
     let tools = request
         .tools
@@ -574,31 +623,55 @@ pub(crate) fn build_request_body(request: &Request) -> ApiRequest {
     }
 }
 
-fn content_to_api(content: &Content) -> ApiContent {
+fn message_to_api(msg: &crate::message::Message) -> Option<ApiMessage> {
+    let content: Vec<ApiContent> = msg.content.iter().filter_map(content_to_api).collect();
+    if content.is_empty() {
+        return None;
+    }
+
+    Some(ApiMessage {
+        role: match msg.role {
+            crate::message::Role::User => "user".to_string(),
+            crate::message::Role::Assistant => "assistant".to_string(),
+        },
+        content,
+    })
+}
+
+fn content_to_api(content: &Content) -> Option<ApiContent> {
     match content {
         Content::Text {
             text,
             cache_control,
-        } => ApiContent::Text {
+        } => Some(ApiContent::Text {
             text: text.clone(),
             cache_control: cache_control.clone(),
-        },
-        Content::ToolUse { id, name, input } => ApiContent::ToolUse {
+        }),
+        Content::Thinking {
+            text,
+            provider: ThinkingProvider::Anthropic,
+            metadata: ThinkingMetadata::Anthropic { signature },
+        } => Some(ApiContent::Thinking {
+            thinking: text.clone(),
+            signature: signature.clone(),
+        }),
+        Content::Thinking { .. } => None,
+        Content::ToolUse { id, name, input } => Some(ApiContent::ToolUse {
             id: id.clone(),
             name: name.clone(),
             input: input.clone(),
-        },
+        }),
         Content::ToolResult {
             tool_use_id,
             content,
             is_error,
             cache_control,
-        } => ApiContent::ToolResult {
+        } => Some(ApiContent::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),
             is_error: *is_error,
             cache_control: cache_control.clone(),
-        },
+        }),
     }
 }
 
@@ -613,6 +686,14 @@ pub(crate) fn convert_response(api: ApiResponse) -> Response {
             } => Content::Text {
                 text,
                 cache_control,
+            },
+            ApiContent::Thinking {
+                thinking,
+                signature,
+            } => Content::Thinking {
+                text: thinking,
+                provider: ThinkingProvider::Anthropic,
+                metadata: ThinkingMetadata::Anthropic { signature },
             },
             ApiContent::ToolUse { id, name, input } => Content::ToolUse { id, name, input },
             ApiContent::ToolResult {
@@ -780,6 +861,86 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_thinking_content_serializes_with_signature() {
+        let req = Request {
+            model: "m".into(),
+            system: None,
+            messages: vec![Message::assistant(vec![
+                Content::thinking(
+                    "reason",
+                    ThinkingProvider::Anthropic,
+                    ThinkingMetadata::anthropic(Some("sig".into())),
+                ),
+                Content::text("visible"),
+            ])],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let content = json["messages"][0]["content"].as_array().unwrap();
+
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "reason");
+        assert_eq!(content[0]["signature"], "sig");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "visible");
+    }
+
+    #[test]
+    fn foreign_thinking_only_message_is_not_serialized_as_empty_message() {
+        let req = Request {
+            model: "m".into(),
+            system: None,
+            messages: vec![
+                Message::assistant(vec![Content::thinking(
+                    "foreign",
+                    ThinkingProvider::OpenAIResponses,
+                    ThinkingMetadata::openai_responses(Some("rs_1".into()), None, 0, None),
+                )]),
+                Message::user_text("next"),
+            ],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "next");
+    }
+
+    #[test]
+    fn anthropic_provider_with_mismatched_metadata_is_dropped() {
+        let req = Request {
+            model: "m".into(),
+            system: None,
+            messages: vec![
+                Message::assistant(vec![Content::thinking(
+                    "bad metadata",
+                    ThinkingProvider::Anthropic,
+                    ThinkingMetadata::None,
+                )]),
+                Message::user_text("next"),
+            ],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+        };
+        let body = build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "next");
+    }
+
+    #[test]
     fn response_with_cache_usage_parses_all_four_fields() {
         let raw = json!({
             "content": [{"type":"text","text":"ok"}],
@@ -810,6 +971,120 @@ mod tests {
         let resp = convert_response(api);
         assert_eq!(resp.usage.cache_creation_input_tokens, 0);
         assert_eq!(resp.usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn streaming_thinking_delta_and_signature_emit_final_block() {
+        use std::collections::VecDeque;
+        let mut blocks: HashMap<usize, BlockState> = HashMap::new();
+        let mut buffer: VecDeque<Result<StreamEvent, ProviderError>> = VecDeque::new();
+        let mut running = Usage::default();
+
+        process_payload(
+            StreamingPayload::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlockStart::Thinking {
+                    thinking: String::new(),
+                    signature: String::new(),
+                },
+            },
+            &mut blocks,
+            &mut buffer,
+            &mut running,
+        );
+        process_payload(
+            StreamingPayload::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::Thinking {
+                    thinking: "reason".into(),
+                },
+            },
+            &mut blocks,
+            &mut buffer,
+            &mut running,
+        );
+        process_payload(
+            StreamingPayload::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::Signature {
+                    signature: "sig".into(),
+                },
+            },
+            &mut blocks,
+            &mut buffer,
+            &mut running,
+        );
+        process_payload(
+            StreamingPayload::ContentBlockStop { index: 0 },
+            &mut blocks,
+            &mut buffer,
+            &mut running,
+        );
+
+        assert!(matches!(
+            buffer.pop_front().unwrap().unwrap(),
+            StreamEvent::ThinkingDelta { text } if text == "reason"
+        ));
+        assert!(matches!(
+            buffer.pop_front().unwrap().unwrap(),
+            StreamEvent::ThinkingBlock {
+                text,
+                provider: ThinkingProvider::Anthropic,
+                metadata: ThinkingMetadata::Anthropic {
+                    signature: Some(signature),
+                },
+            } if text == "reason" && signature == "sig"
+        ));
+    }
+
+    #[test]
+    fn streaming_signature_without_thinking_delta_preserves_empty_block() {
+        use std::collections::VecDeque;
+        let mut blocks: HashMap<usize, BlockState> = HashMap::new();
+        let mut buffer: VecDeque<Result<StreamEvent, ProviderError>> = VecDeque::new();
+        let mut running = Usage::default();
+
+        process_payload(
+            StreamingPayload::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlockStart::Thinking {
+                    thinking: String::new(),
+                    signature: String::new(),
+                },
+            },
+            &mut blocks,
+            &mut buffer,
+            &mut running,
+        );
+        process_payload(
+            StreamingPayload::ContentBlockDelta {
+                index: 0,
+                delta: BlockDelta::Signature {
+                    signature: "sig-only".into(),
+                },
+            },
+            &mut blocks,
+            &mut buffer,
+            &mut running,
+        );
+        process_payload(
+            StreamingPayload::ContentBlockStop { index: 0 },
+            &mut blocks,
+            &mut buffer,
+            &mut running,
+        );
+
+        assert!(matches!(
+            buffer.pop_front().unwrap().unwrap(),
+            StreamEvent::ThinkingBlock {
+                text,
+                provider: ThinkingProvider::Anthropic,
+                metadata: ThinkingMetadata::Anthropic {
+                    signature: Some(signature),
+                },
+            } if text.is_empty() && signature == "sig-only"
+        ));
+        assert!(buffer.is_empty());
     }
 
     #[test]

@@ -371,7 +371,7 @@ fn extend_with_message(out: &mut Vec<ApiMessage>, msg: &Message) {
                             content: wire_content,
                         });
                     }
-                    Content::ToolUse { .. } => {
+                    Content::ToolUse { .. } | Content::Thinking { .. } => {
                         // Should not appear in a user message; skip silently.
                     }
                 }
@@ -401,8 +401,9 @@ fn extend_with_message(out: &mut Vec<ApiMessage>, msg: &Message) {
                             },
                         });
                     }
-                    Content::ToolResult { .. } => {
-                        // Not expected on assistant side; skip.
+                    Content::Thinking { .. } | Content::ToolResult { .. } => {
+                        // Chat Completions has no standard assistant thinking block;
+                        // provider-specific reasoning state is not replayable here.
                     }
                 }
             }
