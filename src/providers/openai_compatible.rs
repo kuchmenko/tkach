@@ -37,6 +37,8 @@ pub struct OpenAICompatible {
     api_key: String,
     base_url: String,
     client: reqwest::Client,
+    /// Headers applied to every request (e.g. `x-opencode-session`).
+    extra_headers: Vec<(String, String)>,
 }
 
 impl OpenAICompatible {
@@ -45,6 +47,7 @@ impl OpenAICompatible {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             client: reqwest::Client::new(),
+            extra_headers: Vec::new(),
         }
     }
 
@@ -56,6 +59,16 @@ impl OpenAICompatible {
     /// - Ollama:   `http://localhost:11434/v1`
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Add a header sent with every request to this provider.
+    /// A later call with the same name replaces the earlier one.
+    pub fn with_extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        let name = name.into();
+        let value = value.into();
+        self.extra_headers.retain(|(n, _)| n != &name);
+        self.extra_headers.push((name, value));
         self
     }
 
@@ -77,15 +90,16 @@ impl LlmProvider for OpenAICompatible {
         });
         let url = format!("{}/chat/completions", self.base_url);
 
-        let response = self
+        let mut request = self
             .client
             .post(&url)
             .bearer_auth(&self.api_key)
             .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await?;
+            .header("accept", "text/event-stream");
+        for (name, value) in &self.extra_headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let response = request.json(&body).send().await?;
 
         let status = response.status().as_u16();
 
@@ -104,14 +118,15 @@ impl LlmProvider for OpenAICompatible {
         let body = build_request_body(&request);
         let url = format!("{}/chat/completions", self.base_url);
 
-        let response = self
+        let mut request = self
             .client
             .post(&url)
             .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+            .header("content-type", "application/json");
+        for (name, value) in &self.extra_headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let response = request.json(&body).send().await?;
 
         let status = response.status().as_u16();
 
