@@ -39,6 +39,10 @@ pub struct OpenAICompatible {
     client: reqwest::Client,
     /// Headers applied to every request (e.g. `x-opencode-session`).
     extra_headers: Vec<(String, String)>,
+    /// Top-level JSON fields added to every request body (e.g. a vendor's
+    /// `reasoning_effort` or `thinking`). Empty by default, so nothing
+    /// non-standard is sent unless the caller asks for it.
+    extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 impl OpenAICompatible {
@@ -48,6 +52,7 @@ impl OpenAICompatible {
             base_url: DEFAULT_BASE_URL.to_string(),
             client: reqwest::Client::new(),
             extra_headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
         }
     }
 
@@ -70,6 +75,26 @@ impl OpenAICompatible {
         self.extra_headers.retain(|(n, _)| n != &name);
         self.extra_headers.push((name, value));
         self
+    }
+
+    /// Add a top-level field to every request body, e.g.
+    /// `with_extra_body("reasoning_effort", json!("none"))`. Fields the
+    /// provider already sets (model, messages, ...) are not overridden.
+    /// A later call with the same key replaces the earlier one.
+    pub fn with_extra_body(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.extra_body.insert(key.into(), value);
+        self
+    }
+
+    /// The request body as JSON with the extra fields added.
+    fn body_json(&self, body: &ApiRequest) -> Result<serde_json::Value, ProviderError> {
+        let mut value = serde_json::to_value(body)?;
+        if let Some(obj) = value.as_object_mut() {
+            for (k, v) in &self.extra_body {
+                obj.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        Ok(value)
     }
 
     /// Read `OPENAI_API_KEY` from the environment.
@@ -99,7 +124,7 @@ impl LlmProvider for OpenAICompatible {
         for (name, value) in &self.extra_headers {
             request = request.header(name.as_str(), value.as_str());
         }
-        let response = request.json(&body).send().await?;
+        let response = request.json(&self.body_json(&body)?).send().await?;
 
         let status = response.status().as_u16();
 
@@ -126,7 +151,7 @@ impl LlmProvider for OpenAICompatible {
         for (name, value) in &self.extra_headers {
             request = request.header(name.as_str(), value.as_str());
         }
-        let response = request.json(&body).send().await?;
+        let response = request.json(&self.body_json(&body)?).send().await?;
 
         let status = response.status().as_u16();
 
@@ -1365,5 +1390,42 @@ mod tests {
             json.get("reasoning").is_none() && json.get("thinking").is_none(),
             "OpenAICompatible must not emit reasoning/thinking; got {json}"
         );
+    }
+
+    fn plain_request() -> Request {
+        Request {
+            model: "deepseek-v4.1-flash".into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+            thinking: None,
+        }
+    }
+
+    #[test]
+    fn extra_body_fields_are_sent_only_when_set() {
+        let req = plain_request();
+        let body = build_request_body(&req);
+
+        let plain = OpenAICompatible::new("k").body_json(&body).unwrap();
+        assert!(plain.get("reasoning_effort").is_none(), "nothing extra by default: {plain}");
+
+        let p = OpenAICompatible::new("k")
+            .with_extra_body("reasoning_effort", serde_json::json!("none"))
+            .with_extra_body("thinking", serde_json::json!({"type": "disabled"}));
+        let json = p.body_json(&body).unwrap();
+        assert_eq!(json["reasoning_effort"], "none");
+        assert_eq!(json["thinking"]["type"], "disabled");
+        assert_eq!(json["model"], "deepseek-v4.1-flash");
+    }
+
+    #[test]
+    fn extra_body_does_not_override_standard_fields() {
+        let req = plain_request();
+        let body = build_request_body(&req);
+        let p = OpenAICompatible::new("k").with_extra_body("model", serde_json::json!("other"));
+        assert_eq!(p.body_json(&body).unwrap()["model"], "deepseek-v4.1-flash");
     }
 }
