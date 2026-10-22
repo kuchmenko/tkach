@@ -306,8 +306,18 @@ struct ApiChoice {
 struct ApiResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    /// Some servers send `"tool_calls": null` instead of leaving it out
+    /// (glm-5.3-flash on OpenCode Go): treat it as no tool calls.
+    #[serde(default, deserialize_with = "null_as_empty")]
     tool_calls: Vec<ApiToolCallIn>,
+}
+
+fn null_as_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -1419,6 +1429,18 @@ mod tests {
         assert_eq!(json["reasoning_effort"], "none");
         assert_eq!(json["thinking"]["type"], "disabled");
         assert_eq!(json["model"], "deepseek-v4.1-flash");
+    }
+
+    #[test]
+    fn null_tool_calls_parse_as_none() {
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": "{\"action\":\"wait\"}",
+            "tool_calls": null
+        });
+        let msg: ApiResponseMessage = serde_json::from_value(raw).unwrap();
+        assert!(msg.tool_calls.is_empty());
+        assert_eq!(msg.content.as_deref(), Some("{\"action\":\"wait\"}"));
     }
 
     #[test]
