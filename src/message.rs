@@ -220,9 +220,11 @@ pub enum StopReason {
 
 /// Token usage report from a provider call.
 ///
-/// `cache_creation_input_tokens` and `cache_read_input_tokens` are
-/// populated only by Anthropic responses when the request used
-/// [`CacheControl`] breakpoints; non-Anthropic providers leave them at 0.
+/// `input_tokens` counts only uncached prompt tokens; cache reads and
+/// cache writes are reported in `cache_read_input_tokens` and
+/// `cache_creation_input_tokens`. Anthropic fills the cache fields when
+/// the request used [`CacheControl`] breakpoints; OpenAI-compatible
+/// providers fill them from `prompt_tokens_details`.
 ///
 /// In streaming mode, the cache fields arrive on the `message_start`
 /// event only; the Anthropic provider merges them across events so the

@@ -37,6 +37,12 @@ pub struct OpenAICompatible {
     api_key: String,
     base_url: String,
     client: reqwest::Client,
+    /// Headers applied to every request (e.g. `x-opencode-session`).
+    extra_headers: Vec<(String, String)>,
+    /// Top-level JSON fields added to every request body (e.g. a vendor's
+    /// `reasoning_effort` or `thinking`). Empty by default, so nothing
+    /// non-standard is sent unless the caller asks for it.
+    extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 impl OpenAICompatible {
@@ -45,6 +51,8 @@ impl OpenAICompatible {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             client: reqwest::Client::new(),
+            extra_headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
         }
     }
 
@@ -57,6 +65,36 @@ impl OpenAICompatible {
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    /// Add a header sent with every request to this provider.
+    /// A later call with the same name replaces the earlier one.
+    pub fn with_extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        let name = name.into();
+        let value = value.into();
+        self.extra_headers.retain(|(n, _)| n != &name);
+        self.extra_headers.push((name, value));
+        self
+    }
+
+    /// Add a top-level field to every request body, e.g.
+    /// `with_extra_body("reasoning_effort", json!("none"))`. Fields the
+    /// provider already sets (model, messages, ...) are not overridden.
+    /// A later call with the same key replaces the earlier one.
+    pub fn with_extra_body(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.extra_body.insert(key.into(), value);
+        self
+    }
+
+    /// The request body as JSON with the extra fields added.
+    fn body_json(&self, body: &ApiRequest) -> Result<serde_json::Value, ProviderError> {
+        let mut value = serde_json::to_value(body)?;
+        if let Some(obj) = value.as_object_mut() {
+            for (k, v) in &self.extra_body {
+                obj.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        Ok(value)
     }
 
     /// Read `OPENAI_API_KEY` from the environment.
@@ -77,15 +115,16 @@ impl LlmProvider for OpenAICompatible {
         });
         let url = format!("{}/chat/completions", self.base_url);
 
-        let response = self
+        let mut request = self
             .client
             .post(&url)
             .bearer_auth(&self.api_key)
             .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await?;
+            .header("accept", "text/event-stream");
+        for (name, value) in &self.extra_headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let response = request.json(&self.body_json(&body)?).send().await?;
 
         let status = response.status().as_u16();
 
@@ -104,14 +143,15 @@ impl LlmProvider for OpenAICompatible {
         let body = build_request_body(&request);
         let url = format!("{}/chat/completions", self.base_url);
 
-        let response = self
+        let mut request = self
             .client
             .post(&url)
             .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+            .header("content-type", "application/json");
+        for (name, value) in &self.extra_headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let response = request.json(&self.body_json(&body)?).send().await?;
 
         let status = response.status().as_u16();
 
@@ -266,8 +306,18 @@ struct ApiChoice {
 struct ApiResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    /// Some servers send `"tool_calls": null` instead of leaving it out
+    /// (glm-5.3-flash on OpenCode Go): treat it as no tool calls.
+    #[serde(default, deserialize_with = "null_as_empty")]
     tool_calls: Vec<ApiToolCallIn>,
+}
+
+fn null_as_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -285,12 +335,41 @@ struct ApiFunctionIn {
     arguments: String,
 }
 
+/// Usage block, shared by full responses and the final stream chunk.
 #[derive(Deserialize)]
 struct ApiUsage {
     #[serde(default)]
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// `cached_tokens` is the OpenAI field; `cache_write_tokens` is sent by
+/// OpenRouter. Both are part of `prompt_tokens`.
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
+}
+
+/// `prompt_tokens` counts cached and cache-write tokens too, while
+/// tkach's `Usage.input_tokens` follows Anthropic and counts only the
+/// uncached rest, so both are subtracted here.
+fn convert_usage(u: ApiUsage) -> Usage {
+    let details = u.prompt_tokens_details.unwrap_or_default();
+    Usage {
+        input_tokens: u
+            .prompt_tokens
+            .saturating_sub(details.cached_tokens)
+            .saturating_sub(details.cache_write_tokens),
+        output_tokens: u.completion_tokens,
+        cache_creation_input_tokens: details.cache_write_tokens,
+        cache_read_input_tokens: details.cached_tokens,
+    }
 }
 
 // --- Conversion ---
@@ -501,14 +580,15 @@ fn convert_response(api: ApiResponse) -> Result<Response, ProviderError> {
         }
     }
     for tc in choice.message.tool_calls {
-        // arguments is a JSON string per OpenAI spec. Treat unparseable
-        // arguments as an empty object rather than failing the whole
-        // response — tool-side schema validation will catch abuse.
+        // arguments is a JSON string per OpenAI spec. Unparseable
+        // arguments are passed on as the raw string (like the Anthropic
+        // provider) rather than failing the whole response, so the tool
+        // can tell "invalid JSON" from "empty arguments".
         let input = if tc.function.arguments.trim().is_empty() {
             Value::Object(Default::default())
         } else {
             serde_json::from_str(&tc.function.arguments)
-                .unwrap_or(Value::Object(Default::default()))
+                .unwrap_or_else(|_| Value::String(tc.function.arguments.clone()))
         };
         content.push(Content::ToolUse {
             id: tc.id,
@@ -535,15 +615,7 @@ fn convert_response(api: ApiResponse) -> Result<Response, ProviderError> {
         _ => StopReason::EndTurn,
     };
 
-    let usage = api
-        .usage
-        .map(|u| Usage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        })
-        .unwrap_or_default();
+    let usage = api.usage.map(convert_usage).unwrap_or_default();
 
     Ok(Response {
         content,
@@ -573,7 +645,7 @@ struct ChatChunk {
     #[serde(default)]
     choices: Vec<ChatChoice>,
     #[serde(default)]
-    usage: Option<ChunkUsage>,
+    usage: Option<ApiUsage>,
 }
 
 #[derive(Deserialize)]
@@ -610,14 +682,6 @@ struct ToolCallFunctionChunk {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChunkUsage {
-    #[serde(default)]
-    prompt_tokens: u32,
-    #[serde(default)]
-    completion_tokens: u32,
 }
 
 #[derive(Default)]
@@ -751,12 +815,7 @@ fn process_chunk(
     }
 
     if let Some(usage) = chunk.usage {
-        buffer.push_back(Ok(StreamEvent::Usage(Usage {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        })));
+        buffer.push_back(Ok(StreamEvent::Usage(convert_usage(usage))));
     }
 }
 
@@ -775,7 +834,8 @@ fn flush_terminal(
         let input: Value = if slot.args_buf.trim().is_empty() {
             Value::Object(Default::default())
         } else {
-            serde_json::from_str(&slot.args_buf).unwrap_or(Value::Object(Default::default()))
+            serde_json::from_str(&slot.args_buf)
+                .unwrap_or_else(|_| Value::String(slot.args_buf.clone()))
         };
         buffer.push_back(Ok(StreamEvent::ToolUse {
             id: slot.id,
@@ -1167,6 +1227,72 @@ mod tests {
     }
 
     #[test]
+    fn response_reports_cached_prompt_tokens() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "ok" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 4060,
+                "completion_tokens": 5,
+                "prompt_tokens_details": { "cached_tokens": 3840, "cache_write_tokens": 20 }
+            }
+        });
+        let api: ApiResponse = serde_json::from_value(raw).unwrap();
+        let usage = convert_response(api).unwrap().usage;
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.cache_read_input_tokens, 3840);
+        assert_eq!(usage.cache_creation_input_tokens, 20);
+    }
+
+    #[test]
+    fn response_without_prompt_tokens_details_has_zero_cache() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "ok" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 3 }
+        });
+        let api: ApiResponse = serde_json::from_value(raw).unwrap();
+        let usage = convert_response(api).unwrap().usage;
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn streaming_usage_chunk_reports_cached_prompt_tokens() {
+        use std::collections::{BTreeMap, VecDeque};
+
+        let chunk: ChatChunk = serde_json::from_value(serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 4060,
+                "completion_tokens": 5,
+                "prompt_tokens_details": { "cached_tokens": 3840 }
+            }
+        }))
+        .unwrap();
+        let mut slots = BTreeMap::new();
+        let mut pending_stop = None;
+        let mut buffer = VecDeque::new();
+        process_chunk(chunk, &mut slots, &mut pending_stop, &mut buffer);
+
+        match buffer.pop_front().unwrap().unwrap() {
+            StreamEvent::Usage(usage) => {
+                assert_eq!(usage.input_tokens, 220);
+                assert_eq!(usage.output_tokens, 5);
+                assert_eq!(usage.cache_read_input_tokens, 3840);
+                assert_eq!(usage.cache_creation_input_tokens, 0);
+            }
+            _ => panic!("expected usage event"),
+        }
+    }
+
+    #[test]
     fn response_decodes_text_and_tool_calls() {
         let raw = serde_json::json!({
             "choices": [{
@@ -1250,6 +1376,52 @@ mod tests {
                 retryable: false,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn invalid_tool_arguments_are_kept_as_raw_string() {
+        use std::collections::{BTreeMap, VecDeque};
+
+        let bad = r#"{"steps": [{"name": "goto", "args": {"x": 1,}}]"#;
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "skill_sequence", "arguments": bad}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let resp = convert_response(serde_json::from_value(raw).unwrap()).unwrap();
+        assert!(matches!(
+            &resp.content[0],
+            Content::ToolUse { input, .. } if input == &Value::String(bad.into())
+        ));
+
+        let chunk: ChatChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": "skill_sequence", "arguments": bad}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap();
+        let mut slots = BTreeMap::new();
+        let mut pending_stop = None;
+        let mut buffer = VecDeque::new();
+        process_chunk(chunk, &mut slots, &mut pending_stop, &mut buffer);
+        flush_terminal(&mut slots, &mut pending_stop, &mut buffer);
+        assert!(matches!(
+            buffer.pop_front().unwrap().unwrap(),
+            StreamEvent::ToolUse { input, .. } if input == Value::String(bad.into())
         ));
     }
 
@@ -1350,5 +1522,57 @@ mod tests {
             json.get("reasoning").is_none() && json.get("thinking").is_none(),
             "OpenAICompatible must not emit reasoning/thinking; got {json}"
         );
+    }
+
+    fn plain_request() -> Request {
+        Request {
+            model: "deepseek-v4.1-flash".into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: None,
+            thinking: None,
+        }
+    }
+
+    #[test]
+    fn extra_body_fields_are_sent_only_when_set() {
+        let req = plain_request();
+        let body = build_request_body(&req);
+
+        let plain = OpenAICompatible::new("k").body_json(&body).unwrap();
+        assert!(
+            plain.get("reasoning_effort").is_none(),
+            "nothing extra by default: {plain}"
+        );
+
+        let p = OpenAICompatible::new("k")
+            .with_extra_body("reasoning_effort", serde_json::json!("none"))
+            .with_extra_body("thinking", serde_json::json!({"type": "disabled"}));
+        let json = p.body_json(&body).unwrap();
+        assert_eq!(json["reasoning_effort"], "none");
+        assert_eq!(json["thinking"]["type"], "disabled");
+        assert_eq!(json["model"], "deepseek-v4.1-flash");
+    }
+
+    #[test]
+    fn null_tool_calls_parse_as_none() {
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": "{\"action\":\"wait\"}",
+            "tool_calls": null
+        });
+        let msg: ApiResponseMessage = serde_json::from_value(raw).unwrap();
+        assert!(msg.tool_calls.is_empty());
+        assert_eq!(msg.content.as_deref(), Some("{\"action\":\"wait\"}"));
+    }
+
+    #[test]
+    fn extra_body_does_not_override_standard_fields() {
+        let req = plain_request();
+        let body = build_request_body(&req);
+        let p = OpenAICompatible::new("k").with_extra_body("model", serde_json::json!("other"));
+        assert_eq!(p.body_json(&body).unwrap()["model"], "deepseek-v4.1-flash");
     }
 }
