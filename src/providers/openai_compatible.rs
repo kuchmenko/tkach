@@ -335,12 +335,41 @@ struct ApiFunctionIn {
     arguments: String,
 }
 
+/// Usage block, shared by full responses and the final stream chunk.
 #[derive(Deserialize)]
 struct ApiUsage {
     #[serde(default)]
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// `cached_tokens` is the OpenAI field; `cache_write_tokens` is sent by
+/// OpenRouter. Both are part of `prompt_tokens`.
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
+}
+
+/// `prompt_tokens` counts cached and cache-write tokens too, while
+/// tkach's `Usage.input_tokens` follows Anthropic and counts only the
+/// uncached rest, so both are subtracted here.
+fn convert_usage(u: ApiUsage) -> Usage {
+    let details = u.prompt_tokens_details.unwrap_or_default();
+    Usage {
+        input_tokens: u
+            .prompt_tokens
+            .saturating_sub(details.cached_tokens)
+            .saturating_sub(details.cache_write_tokens),
+        output_tokens: u.completion_tokens,
+        cache_creation_input_tokens: details.cache_write_tokens,
+        cache_read_input_tokens: details.cached_tokens,
+    }
 }
 
 // --- Conversion ---
@@ -586,15 +615,7 @@ fn convert_response(api: ApiResponse) -> Result<Response, ProviderError> {
         _ => StopReason::EndTurn,
     };
 
-    let usage = api
-        .usage
-        .map(|u| Usage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        })
-        .unwrap_or_default();
+    let usage = api.usage.map(convert_usage).unwrap_or_default();
 
     Ok(Response {
         content,
@@ -624,7 +645,7 @@ struct ChatChunk {
     #[serde(default)]
     choices: Vec<ChatChoice>,
     #[serde(default)]
-    usage: Option<ChunkUsage>,
+    usage: Option<ApiUsage>,
 }
 
 #[derive(Deserialize)]
@@ -661,14 +682,6 @@ struct ToolCallFunctionChunk {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChunkUsage {
-    #[serde(default)]
-    prompt_tokens: u32,
-    #[serde(default)]
-    completion_tokens: u32,
 }
 
 #[derive(Default)]
@@ -802,12 +815,7 @@ fn process_chunk(
     }
 
     if let Some(usage) = chunk.usage {
-        buffer.push_back(Ok(StreamEvent::Usage(Usage {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        })));
+        buffer.push_back(Ok(StreamEvent::Usage(convert_usage(usage))));
     }
 }
 
@@ -826,7 +834,8 @@ fn flush_terminal(
         let input: Value = if slot.args_buf.trim().is_empty() {
             Value::Object(Default::default())
         } else {
-            serde_json::from_str(&slot.args_buf).unwrap_or_else(|_| Value::String(slot.args_buf.clone()))
+            serde_json::from_str(&slot.args_buf)
+                .unwrap_or_else(|_| Value::String(slot.args_buf.clone()))
         };
         buffer.push_back(Ok(StreamEvent::ToolUse {
             id: slot.id,
@@ -1218,6 +1227,72 @@ mod tests {
     }
 
     #[test]
+    fn response_reports_cached_prompt_tokens() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "ok" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 4060,
+                "completion_tokens": 5,
+                "prompt_tokens_details": { "cached_tokens": 3840, "cache_write_tokens": 20 }
+            }
+        });
+        let api: ApiResponse = serde_json::from_value(raw).unwrap();
+        let usage = convert_response(api).unwrap().usage;
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.cache_read_input_tokens, 3840);
+        assert_eq!(usage.cache_creation_input_tokens, 20);
+    }
+
+    #[test]
+    fn response_without_prompt_tokens_details_has_zero_cache() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "ok" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 3 }
+        });
+        let api: ApiResponse = serde_json::from_value(raw).unwrap();
+        let usage = convert_response(api).unwrap().usage;
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn streaming_usage_chunk_reports_cached_prompt_tokens() {
+        use std::collections::{BTreeMap, VecDeque};
+
+        let chunk: ChatChunk = serde_json::from_value(serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 4060,
+                "completion_tokens": 5,
+                "prompt_tokens_details": { "cached_tokens": 3840 }
+            }
+        }))
+        .unwrap();
+        let mut slots = BTreeMap::new();
+        let mut pending_stop = None;
+        let mut buffer = VecDeque::new();
+        process_chunk(chunk, &mut slots, &mut pending_stop, &mut buffer);
+
+        match buffer.pop_front().unwrap().unwrap() {
+            StreamEvent::Usage(usage) => {
+                assert_eq!(usage.input_tokens, 220);
+                assert_eq!(usage.output_tokens, 5);
+                assert_eq!(usage.cache_read_input_tokens, 3840);
+                assert_eq!(usage.cache_creation_input_tokens, 0);
+            }
+            _ => panic!("expected usage event"),
+        }
+    }
+
+    #[test]
     fn response_decodes_text_and_tool_calls() {
         let raw = serde_json::json!({
             "choices": [{
@@ -1467,7 +1542,10 @@ mod tests {
         let body = build_request_body(&req);
 
         let plain = OpenAICompatible::new("k").body_json(&body).unwrap();
-        assert!(plain.get("reasoning_effort").is_none(), "nothing extra by default: {plain}");
+        assert!(
+            plain.get("reasoning_effort").is_none(),
+            "nothing extra by default: {plain}"
+        );
 
         let p = OpenAICompatible::new("k")
             .with_extra_body("reasoning_effort", serde_json::json!("none"))
