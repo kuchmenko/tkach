@@ -1143,7 +1143,7 @@ fn parse_tool_arguments(arguments: &str) -> Value {
     if arguments.trim().is_empty() {
         Value::Object(Default::default())
     } else {
-        serde_json::from_str(arguments).unwrap_or(Value::Object(Default::default()))
+        serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
     }
 }
 

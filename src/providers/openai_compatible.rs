@@ -551,14 +551,15 @@ fn convert_response(api: ApiResponse) -> Result<Response, ProviderError> {
         }
     }
     for tc in choice.message.tool_calls {
-        // arguments is a JSON string per OpenAI spec. Treat unparseable
-        // arguments as an empty object rather than failing the whole
-        // response — tool-side schema validation will catch abuse.
+        // arguments is a JSON string per OpenAI spec. Unparseable
+        // arguments are passed on as the raw string (like the Anthropic
+        // provider) rather than failing the whole response, so the tool
+        // can tell "invalid JSON" from "empty arguments".
         let input = if tc.function.arguments.trim().is_empty() {
             Value::Object(Default::default())
         } else {
             serde_json::from_str(&tc.function.arguments)
-                .unwrap_or(Value::Object(Default::default()))
+                .unwrap_or_else(|_| Value::String(tc.function.arguments.clone()))
         };
         content.push(Content::ToolUse {
             id: tc.id,
@@ -825,7 +826,7 @@ fn flush_terminal(
         let input: Value = if slot.args_buf.trim().is_empty() {
             Value::Object(Default::default())
         } else {
-            serde_json::from_str(&slot.args_buf).unwrap_or(Value::Object(Default::default()))
+            serde_json::from_str(&slot.args_buf).unwrap_or_else(|_| Value::String(slot.args_buf.clone()))
         };
         buffer.push_back(Ok(StreamEvent::ToolUse {
             id: slot.id,
@@ -1300,6 +1301,52 @@ mod tests {
                 retryable: false,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn invalid_tool_arguments_are_kept_as_raw_string() {
+        use std::collections::{BTreeMap, VecDeque};
+
+        let bad = r#"{"steps": [{"name": "goto", "args": {"x": 1,}}]"#;
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "skill_sequence", "arguments": bad}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let resp = convert_response(serde_json::from_value(raw).unwrap()).unwrap();
+        assert!(matches!(
+            &resp.content[0],
+            Content::ToolUse { input, .. } if input == &Value::String(bad.into())
+        ));
+
+        let chunk: ChatChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": "skill_sequence", "arguments": bad}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap();
+        let mut slots = BTreeMap::new();
+        let mut pending_stop = None;
+        let mut buffer = VecDeque::new();
+        process_chunk(chunk, &mut slots, &mut pending_stop, &mut buffer);
+        flush_terminal(&mut slots, &mut pending_stop, &mut buffer);
+        assert!(matches!(
+            buffer.pop_front().unwrap().unwrap(),
+            StreamEvent::ToolUse { input, .. } if input == Value::String(bad.into())
         ));
     }
 
