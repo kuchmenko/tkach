@@ -266,6 +266,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "single request mapping test; the assertions describe one replayed history"
+    )]
     fn request_replays_openai_reasoning_and_tool_state() {
         let req = Request {
             model: "gpt-5".into(),
@@ -315,6 +319,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "single decoding test; the assertions describe one response payload"
+    )]
     fn non_streaming_response_decodes_reasoning_text_and_tools() {
         let raw = json!({
             "status": "completed",
@@ -368,6 +376,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "single stream test; the assertions describe one event sequence"
+    )]
     fn streaming_reasoning_summary_emits_delta_and_final_block() {
         let mut parser = proto::ResponsesSseParser::default();
         let mut out = VecDeque::new();

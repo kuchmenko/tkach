@@ -429,6 +429,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "single request body test; the assertions describe one envelope"
+    )]
     fn body_uses_codex_envelope() {
         let body = build_request_body(&sample_request(), None, Some(&OpenAISummary::Auto));
 

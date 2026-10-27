@@ -492,6 +492,10 @@ where
     })
 }
 
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "one match over the stream payload variants, each arm appends to the shared block state"
+)]
 fn process_payload(
     payload: StreamingPayload,
     blocks: &mut HashMap<usize, BlockState>,

@@ -711,6 +711,10 @@ impl ToolExecutor {
     /// Drive a single call through the admission-control pipeline. Returns
     /// `(idx, Content)` so the caller in `execute_batch` can place the
     /// result into the input-ordered output slot.
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "admission pipeline: short circuit, approval, timeout, execute and error mapping happen in sequence"
+    )]
     async fn dispatch_one(
         &self,
         idx: usize,
