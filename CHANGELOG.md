@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1](https://github.com/kuchmenko/tkach/compare/tkach-v0.6.0...tkach-v0.6.1) (2026-10-27)
+
+
+### Features
+
+* **openai:** extra headers and body fields, null tool_calls, raw invalid tool arguments, cached tokens ([#53](https://github.com/kuchmenko/tkach/issues/53)) ([e9c97a0](https://github.com/kuchmenko/tkach/commit/e9c97a0c1752b07c8c48312cf232af13e070cc31))
+
+
+### Bug Fixes
+
+* **openai:** accept null cached_tokens and cache_write_tokens ([#55](https://github.com/kuchmenko/tkach/issues/55)) ([a7cd448](https://github.com/kuchmenko/tkach/commit/a7cd44888854ac8fcc8ca9b3968712c5858a709e))
+
 ## [0.6.0](https://github.com/kuchmenko/tkach/compare/tkach-v0.5.0...tkach-v0.6.0) (2026-08-20)
 
 
