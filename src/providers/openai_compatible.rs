@@ -308,16 +308,18 @@ struct ApiResponseMessage {
     content: Option<String>,
     /// Some servers send `"tool_calls": null` instead of leaving it out
     /// (glm-5.3-flash on OpenCode Go): treat it as no tool calls.
-    #[serde(default, deserialize_with = "null_as_empty")]
+    #[serde(default, deserialize_with = "null_as_default")]
     tool_calls: Vec<ApiToolCallIn>,
 }
 
-fn null_as_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+/// Reads an explicit JSON `null` as the type's default. `#[serde(default)]`
+/// alone covers only a missing field.
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
+    T: Deserialize<'de> + Default,
 {
-    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -347,12 +349,13 @@ struct ApiUsage {
 }
 
 /// `cached_tokens` is the OpenAI field; `cache_write_tokens` is sent by
-/// OpenRouter. Both are part of `prompt_tokens`.
+/// OpenRouter. Both are part of `prompt_tokens`. Some servers send them
+/// as `null` (glm-5.3-flash), which counts as 0.
 #[derive(Deserialize, Default)]
 struct PromptTokensDetails {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     cached_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     cache_write_tokens: u32,
 }
 
@@ -1255,6 +1258,46 @@ mod tests {
                 "finish_reason": "stop"
             }],
             "usage": { "prompt_tokens": 10, "completion_tokens": 3 }
+        });
+        let api: ApiResponse = serde_json::from_value(raw).unwrap();
+        let usage = convert_response(api).unwrap().usage;
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn response_with_null_cache_fields_has_zero_cache() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "ok" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 3,
+                "prompt_tokens_details": { "cached_tokens": null, "cache_write_tokens": null }
+            }
+        });
+        let api: ApiResponse = serde_json::from_value(raw).unwrap();
+        let usage = convert_response(api).unwrap().usage;
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn response_with_null_prompt_tokens_details_has_zero_cache() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "ok" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 3,
+                "prompt_tokens_details": null
+            }
         });
         let api: ApiResponse = serde_json::from_value(raw).unwrap();
         let usage = convert_response(api).unwrap().usage;
