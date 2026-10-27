@@ -65,6 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `read` tool returns `is_error: true`; the loop should keep going,
 /// the model's next turn should explain the failure, and final
 /// outcome should be a clean `Ok` with `EndTurn`.
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "one scenario: setup, stream assertions and cleanup run in order"
+)]
 async fn phase1_tool_failure(provider: &Arc<Anthropic>) -> Result<(), Box<dyn std::error::Error>> {
     // A path inside an empty scratch dir, guaranteed non-existent.
     let dir = std::env::temp_dir().join("tkach_streaming_resilience_phase1");
@@ -153,6 +157,10 @@ async fn phase1_tool_failure(provider: &Arc<Anthropic>) -> Result<(), Box<dyn st
 /// then cancel fires. With `kill_on_drop(true)` + `tokio::select!` on
 /// `ctx.cancel`, the child must be killed promptly. End-to-end wall
 /// time should be far less than 10s.
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "one scenario: setup, cancel timing and assertion run in order"
+)]
 async fn phase2_cancel_during_tool(
     provider: &Arc<Anthropic>,
 ) -> Result<(), Box<dyn std::error::Error>> {

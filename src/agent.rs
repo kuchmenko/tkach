@@ -202,6 +202,10 @@ impl Agent {
         (future, handle)
     }
 
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "one turn loop: stop checks, provider call, tool batch and history update must stay in this order"
+    )]
     async fn run_loop(
         self,
         messages: Vec<Message>,
@@ -487,6 +491,14 @@ impl Agent {
     /// turn counter, same cancel checkpoints, same history shape — but
     /// the per-turn provider call yields a stream rather than a
     /// buffered Response.
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "mirrors run_loop turn by turn; splitting would duplicate the shared turn state"
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "streaming twin of run_loop; each block is one phase of the same turn"
+    )]
     async fn run_streaming_loop(
         self,
         messages: Vec<Message>,

@@ -782,6 +782,10 @@ where
     })
 }
 
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "one match over the chunk deltas, each branch updates the same tool slots and buffer"
+)]
 fn process_chunk(
     chunk: ChatChunk,
     slots: &mut BTreeMap<usize, ToolSlot>,
@@ -951,6 +955,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "single request mapping test; the assertions describe one request body"
+    )]
     fn request_maps_system_and_user_text() {
         let req = Request {
             model: "gpt-4".into(),
@@ -1293,6 +1301,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "single decoding test; the assertions describe one response payload"
+    )]
     fn response_decodes_text_and_tool_calls() {
         let raw = serde_json::json!({
             "choices": [{
@@ -1350,6 +1362,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "table style test over status codes; one assertion block per case reads better than helpers"
+    )]
     fn classify_maps_retryable_status_codes() {
         assert!(matches!(
             classify_error(429, "".into(), Some(1000)),
